@@ -1,0 +1,63 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'ua.com.dtek.scraper'
+version = '4.0.1' // TelegramService Integration
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
+tasks.withType(JavaExec) {
+    jvmArgs += '-Dfile.encoding=UTF-8'
+}
+
+dependencies {
+    // --- Core Scraper ---
+    implementation 'com.codeborne:selenide:7.12.0'
+    implementation 'org.jsoup:jsoup:1.17.2'
+    implementation 'org.slf4j:slf4j-simple:2.0.13'
+
+    // --- v4.0.0: Telegram Bot ---
+    implementation 'org.telegram:telegrambots:6.9.7.1'
+
+    // --- v4.0.0: Database ---
+    implementation 'org.xerial:sqlite-jdbc:3.45.3.0'
+
+    // --- v4.0.1: JSON Serialization (for saving schedules to DB) ---
+    implementation 'com.google.code.gson:gson:2.10.1'
+
+    // --- Testing ---
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+application {
+    mainClass = 'ua.com.dtek.scraper.DtekScraperBot'
+    applicationDefaultJvmArgs += ['-Dfile.encoding=UTF-8']
+}
+
+shadowJar {
+    // Забезпечуємо, що маніфест jar-файлу буде створено
+    manifest {
+        attributes(
+                'Main-Class': 'ua.com.dtek.scraper.DtekScraperBot'
+        )
+    }
+}
+
+test {
+    useJUnitPlatform()
+}

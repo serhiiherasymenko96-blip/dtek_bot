@@ -1,0 +1,61 @@
+.gradle
+build/
+.gradletasknamecache
+gradle-app.setting
+
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### IntelliJ IDEA ###
+.idea/modules.xml
+.idea/jarRepositories.xml
+.idea/compiler.xml
+.idea/libraries/
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+# --- Operating System ---
+.DS_Store
+Thumbs.db
+
+# --- Application Data (CRITICAL) ---
+# Ignore the actual database file
+*.db
+
+# Ignore log files
+*.log
+
+# Ignore the old schedule cache file (from v3.0)
+*.cache
+
+# --- Secrets (CRITICAL) ---
+# Ignore the configuration file that contains the bot token.
+# Commit config.properties.template instead.
+config.properties
