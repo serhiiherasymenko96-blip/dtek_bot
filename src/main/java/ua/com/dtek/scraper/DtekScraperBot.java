@@ -2,283 +2,258 @@ package ua.com.dtek.scraper;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
-import java.lang.reflect.Type;
-
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
+import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
+import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
+import org.telegram.telegrambots.meta.api.objects.Message;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 import ua.com.dtek.scraper.config.AppConfig;
+import ua.com.dtek.scraper.config.BrowserConfig;
 import ua.com.dtek.scraper.dto.Address;
 import ua.com.dtek.scraper.dto.TimeInterval;
+import ua.com.dtek.scraper.parser.ScheduleParser;
 import ua.com.dtek.scraper.service.DatabaseService;
 import ua.com.dtek.scraper.service.DtekScraperService;
 import ua.com.dtek.scraper.service.NotificationService;
-import ua.com.dtek.scraper.parser.ScheduleParser;
-import ua.com.dtek.scraper.config.BrowserConfig;
 
-// --- NEW IMPORT (v4.2.1) ---
-import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
-// --- END NEW IMPORT ---
+// --- FIX 1 ---
+// Added missing imports for Instant and Duration
+import java.time.Duration;
+import java.time.Instant;
+// --- END FIX ---
 
+import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
  * Main entry point and the Telegram Bot class.
- * <p>
- * This class is responsible for:
- * 1. Starting the application (main method).
- * 2. Registering the bot with the Telegram API.
- * 3. Handling incoming user commands (like /start) and button clicks.
- * 4. Initializing and starting the background monitoring services.
  *
  * @author Serhii Herasymenko
- * @version 4.2.1
+ * @version 4.2.3 (Fixes compilation errors)
  */
 public class DtekScraperBot extends TelegramLongPollingBot {
 
     private final AppConfig appConfig;
     private final DatabaseService dbService;
     private final NotificationService notificationService;
-
-    // --- NEW (v4.2.0) ---
-    // Added Gson and Type to deserialize schedules from DB on user request
     private final Gson gson = new Gson();
     private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
-    // --- END NEW ---
 
     public DtekScraperBot(AppConfig appConfig, DatabaseService dbService, NotificationService notificationService) {
         super(appConfig.getBotToken());
         this.appConfig = appConfig;
         this.dbService = dbService;
         this.notificationService = notificationService;
-        // Pass a reference of the bot (this) to the notification service
-        // so it can send messages.
         this.notificationService.setBot(this);
     }
 
-    /**
-     * Main application entry point.
-     * Initializes and launches the bot and monitoring services.
-     */
+    @Override
+    public String getBotUsername() {
+        return appConfig.getBotUsername();
+    }
+
     public static void main(String[] args) {
-        System.out.println("Starting DTEK Scraper Bot Service (v4.0.0)...");
+        Instant start = Instant.now();
+        System.out.println("Starting DTEK Scraper Bot Service (v4.2.3)...");
 
         try {
             // 1. Load application configuration
             AppConfig config = new AppConfig();
             config.loadConfig();
 
-            // 2. Configure the browser (headless, etc.)
+            // 2. Configure the browser (Selenide)
             BrowserConfig.setupSelenide();
 
-            // 3. Initialize core services
-            DatabaseService db = new DatabaseService(config.getDatabasePath());
-            db.initDatabase(config.getAddresses()); // Initialize DB and load addresses
+            // 3. Initialize Database Service
+            // (Uses 2-argument constructor)
+            DatabaseService dbService = new DatabaseService(
+                    config.getDatabasePath(),
+                    config.getAddresses()
+            );
 
+            // 4. Initialize Database
+            // (Uses 0-argument initDatabase)
+            dbService.initDatabase();
+
+            // 5. Initialize other services
             ScheduleParser parser = new ScheduleParser();
             DtekScraperService scraperService = new DtekScraperService(parser);
+            NotificationService notificationService = new NotificationService(
+                    dbService,
+                    scraperService,
+                    parser,
+                    config.getAddresses()
+            );
 
-            // (FIX 1) Pass the 'parser' instance to the NotificationService constructor
-            NotificationService notificationSvc = new NotificationService(db, scraperService, parser, config.getAddresses());
-
-            // 4. Register and start the Telegram Bot
+            // 6. Register and start the bot
             TelegramBotsApi botsApi = new TelegramBotsApi(DefaultBotSession.class);
-            DtekScraperBot bot = new DtekScraperBot(config, db, notificationSvc);
+            DtekScraperBot bot = new DtekScraperBot(config, dbService, notificationService);
             botsApi.registerBot(bot);
 
-            // 5. Start the background monitoring tasks
-            notificationSvc.startMonitoring();
+            // 7. Start background monitoring tasks
+            notificationService.startMonitoring();
 
             System.out.println("Bot successfully started and monitoring tasks are scheduled.");
+            System.out.printf("Startup complete in %.3f s.\n",
+                    Duration.between(start, Instant.now()).toMillis() / 1000.0);
 
         } catch (Exception e) {
-            System.err.println("[FATAL] A top-level critical error occurred during startup:");
+            System.err.println("\n[FATAL] A top-level critical error occurred during startup:");
             e.printStackTrace();
             System.exit(1); // Exit if startup fails
         }
     }
 
-    /**
-     * Main handler for all incoming Telegram updates (messages, button clicks).
-     */
     @Override
     public void onUpdateReceived(Update update) {
         try {
             if (update.hasMessage() && update.getMessage().hasText()) {
-                // Handle text commands
                 handleTextMessage(update);
             } else if (update.hasCallbackQuery()) {
-                // Handle button clicks
                 handleCallbackQuery(update.getCallbackQuery());
             }
-        } catch (Exception e) {
+        } catch (TelegramApiException e) {
             System.err.println("Error processing update: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    /**
-     * Handles incoming text messages (e.g., /start).
-     */
     private void handleTextMessage(Update update) throws TelegramApiException {
-        long chatId = update.getMessage().getChatId();
-        String messageText = update.getMessage().getText();
-        String firstName = update.getMessage().getFrom().getFirstName();
+        Message message = update.getMessage();
+        long chatId = message.getChatId();
 
-        if ("/start".equals(messageText)) {
+        if ("/start".equals(message.getText())) {
             System.out.println("Received /start command from user: " + chatId);
-            dbService.registerUser(chatId, firstName); // Register user in DB
             sendWelcomeMessage(chatId);
-        } else {
-            SendMessage message = new SendMessage(String.valueOf(chatId), "Будь ласка, використайте команду /start, щоб почати.");
-            execute(message);
         }
     }
 
-    /**
-     * Sends the initial welcome message with address selection buttons.
-     */
     private void sendWelcomeMessage(Long chatId) throws TelegramApiException {
-        String welcomeText = "Вітаю! 👋\n\n" +
-                "Я бот для моніторингу графіків відключень ДТЕК.\n" +
-                "Будь ласка, оберіть вашу адресу зі списку, щоб я міг надсилати вам сповіщення:";
-
-        SendMessage message = new SendMessage(String.valueOf(chatId), welcomeText);
+        SendMessage message = new SendMessage();
+        message.setChatId(Long.toString(chatId)); // Use Long.toString for safety
+        message.setText("👋 Вітаю!\n\nОберіть адресу, за якою ви хочете відслідковувати графіки відключень:");
         message.setReplyMarkup(buildAddressKeyboard());
         execute(message);
     }
 
-    /**
-     * Creates the dynamic inline keyboard with address buttons from config.
-     */
     private InlineKeyboardMarkup buildAddressKeyboard() {
-        List<List<InlineKeyboardButton>> keyboard = new ArrayList<>();
+        InlineKeyboardMarkup.InlineKeyboardMarkupBuilder keyboardBuilder = InlineKeyboardMarkup.builder();
         Map<String, Address> addresses = appConfig.getAddresses();
 
         for (Map.Entry<String, Address> entry : addresses.entrySet()) {
-            InlineKeyboardButton button = new InlineKeyboardButton();
-            button.setText(entry.getValue().name()); // Button text (e.g., "Виконкомівська, 24/А")
-            button.setCallbackData(entry.getKey());  // Button ID (e.g., "address_1")
-            keyboard.add(List.of(button));
-        }
 
-        return new InlineKeyboardMarkup(keyboard);
+            // --- FIX 2 ---
+            // The method is 'keyboardRow', not 'row'
+            keyboardBuilder.keyboardRow(List.of(
+                    // --- END FIX ---
+
+                    InlineKeyboardButton.builder()
+                            .text(entry.getValue().name())
+                            .callbackData(entry.getKey()) // e.g., "address.1"
+                            .build()
+            ));
+        }
+        return keyboardBuilder.build();
     }
 
     /**
      * Handles button clicks (CallbackQuery).
      *
-     * v4.2.1 Update: Added AnswerCallbackQuery to prevent duplicate client requests.
+     * v4.2.3 Update: Fixes all compilation errors.
      */
-    private void handleCallbackQuery(org.telegram.telegrambots.meta.api.objects.CallbackQuery callbackQuery) throws TelegramApiException {
+    private void handleCallbackQuery(CallbackQuery callbackQuery) throws TelegramApiException {
         long chatId = callbackQuery.getMessage().getChatId();
-        long messageId = callbackQuery.getMessage().getMessageId();
+        long messageId = callbackQuery.getMessage().getMessageId(); // This is 'long'
         String addressKey = callbackQuery.getData(); // e.g., "address.1"
         String callbackQueryId = callbackQuery.getId();
+        User user = callbackQuery.getFrom();
 
-        // --- FIX (v4.2.1) ---
-        // 1. Immediately answer the callback query.
-        // This stops the "loading" spinner on the user's client
-        // and prevents Telegram from re-sending the same query.
+        // 1. Immediately answer the callback query to stop the "loading" spinner
         AnswerCallbackQuery answer = new AnswerCallbackQuery();
         answer.setCallbackQueryId(callbackQueryId);
         execute(answer);
-        // --- END FIX ---
 
         System.out.println("User " + chatId + " selected address key: " + addressKey);
 
-        // 1. Get the address details from the config
+        // 2. Get the address details from the config
         Address selectedAddress = appConfig.getAddresses().get(addressKey);
         if (selectedAddress == null) {
-            System.err.println("Critical: User " + chatId + " clicked unknown address key: " + addressKey);
+            System.err.println("Error: User " + chatId + " selected unknown address key: " + addressKey);
             return;
         }
 
-        // 2. Save the user's choice to the database
+        // --- FIX 3 & 4 ---
+        // 3. Save the user's choice to the database
+        // (Call the two methods that now exist in DatabaseService v4.2.3)
         dbService.setUserAddress(chatId, addressKey);
-        System.out.println("User " + chatId + " subscribed to " + addressKey);
+        dbService.updateUserName(chatId, user.getFirstName());
+        // --- END FIX ---
 
-        // --- NEW LOGIC (v4.2.0) ---
-
-        // 3. Get the most recent schedule from our *own* database (fast!)
+        // 4. Get the *current* cached schedule from the DB
         String scheduleJson = dbService.getSchedule(addressKey);
-        List<TimeInterval> schedule = null;
-        if (scheduleJson != null) {
-            schedule = gson.fromJson(scheduleJson, scheduleListType);
+
+        // 5. Build the confirmation message
+        EditMessageText editedMessage = new EditMessageText();
+        editedMessage.setChatId(Long.toString(chatId)); // Use Long.toString
+
+        // --- FIX 5 ---
+        // 'messageId' is a primitive 'long', it must be cast to 'int'
+        editedMessage.setMessageId((int) messageId);
+        // --- END FIX ---
+
+        editedMessage.setParseMode("Markdown");
+
+        StringBuilder textBuilder = new StringBuilder();
+        textBuilder.append("✅ *Чудово! Ви підписалися на адресу:*\n");
+        textBuilder.append(selectedAddress.name()).append("\n\n");
+        textBuilder.append("💡 *Поточний графік:*\n");
+
+        if (scheduleJson == null) {
+            // Case 1: (v4.2.2 fix) Schedule is NULL (unknown)
+            textBuilder.append("Обробка запиту... Графік для цієї адреси завантажується.\n\n");
+            textBuilder.append("Ви отримаєте сповіщення, щойно він з'явиться (зазвичай протягом 30 хв).");
+        } else {
+            List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
+            if (schedule.isEmpty()) {
+                // Case 2: Schedule is "[]" (empty list)
+                textBuilder.append("Відключень на сьогодні не заплановано.");
+            } else {
+                // Case 3: Schedule has intervals
+                for (TimeInterval interval : schedule) {
+                    textBuilder.append("•  `").append(interval.startTime()).append(" - ").append(interval.endTime()).append("`\n");
+                }
+            }
         }
 
-        // 4. Build the confirmation message *with* the current schedule
-        String confirmationText = "✅ *Чудово! Ви підписалися на адресу:*\n" +
-                "*" + selectedAddress.name() + "*\n\n" +
-                formatScheduleForMessage(schedule); // Use new helper to format the schedule
-
-        // --- END NEW LOGIC ---
-
-        // 5. Send a confirmation message by editing the original message
-        EditMessageText editMessage = new EditMessageText();
-        editMessage.setChatId(String.valueOf(chatId));
-        editMessage.setMessageId((int) messageId);
-        editMessage.setText(confirmationText);
-        editMessage.setParseMode("Markdown"); // Allow bold text
-        editMessage.setReplyMarkup(null); // Remove buttons
-
-        execute(editMessage);
+        editedMessage.setText(textBuilder.toString());
+        execute(editedMessage);
     }
 
     /**
-     * NEW (v4.2.0)
-     * Helper method to format a schedule list into a human-readable string for a message.
+     * Public method to send a message (used by NotificationService).
      *
-     * @param schedule The schedule list (can be null or empty).
-     * @return A formatted string.
+     * @param chatId  The target chat ID.
+     * @param message The message text (Markdown supported).
      */
-    private String formatScheduleForMessage(List<TimeInterval> schedule) {
-        if (schedule == null) {
-            // Case 1: Bot has just started, no schedule scraped yet.
-            return "Обробка запиту...\n_Поточний графік буде завантажено та показано тут протягом 30 хвилин._";
-        }
-
-        if (schedule.isEmpty()) {
-            // Case 2: We scraped, and there are no shutdowns.
-            return "💡 *Поточний графік:*\nВідключень на сьогодні не заплановано.";
-        }
-
-        // Case 3: We have a schedule.
-        StringBuilder sb = new StringBuilder("💡 *Поточний графік:*\n");
-        for (TimeInterval interval : schedule) {
-            sb.append("•  `").append(interval.startTime()).append(" - ").append(interval.endTime()).append("`\n");
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Public method for NotificationService to send messages.
-     *
-     * @param chatId  The target user's chat ID.
-     * @param message The text to send.
-     */
-    public void sendMessage(Long chatId, String message) {
+    public void sendMessage(long chatId, String message) {
+        SendMessage sendMessage = new SendMessage();
+        sendMessage.setChatId(Long.toString(chatId)); // Use Long.toString
+        sendMessage.setText(message);
+        sendMessage.setParseMode("Markdown");
         try {
-            SendMessage sendMessage = new SendMessage(String.valueOf(chatId), message);
-            sendMessage.setParseMode("Markdown"); // Enable formatting for all messages
             execute(sendMessage);
         } catch (TelegramApiException e) {
-            System.err.println("Failed to send message to user " + chatId + ": " + e.getMessage());
-            // TODO: Add logic here to handle blocked bots (e.g., remove user from DB)
+            System.err.println("Failed to send message to " + chatId + ": " + e.getMessage());
         }
-    }
-
-
-    @Override
-    public String getBotUsername() {
-        return appConfig.getBotUsername();
     }
 }

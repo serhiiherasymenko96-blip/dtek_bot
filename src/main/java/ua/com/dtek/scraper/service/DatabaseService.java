@@ -4,6 +4,9 @@ import com.google.gson.Gson;
 import ua.com.dtek.scraper.dto.Address;
 import ua.com.dtek.scraper.dto.TimeInterval;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
@@ -11,283 +14,286 @@ import java.util.Map;
 
 /**
  * Manages all database operations (SQLite).
- * This service handles users, subscriptions, and cached schedules.
- * <p>
- * v4.0.1: Updated to use Gson to serialize List<TimeInterval> into a JSON
- * string for storage in the 'schedules' table.
+ * This service handles user subscriptions and caches schedules.
+ *
+ * @version 4.2.3 (Fixes compilation errors)
  */
 public class DatabaseService {
 
     private final String dbUrl;
-    private final Gson gson = new Gson(); // For JSON serialization
+    private final Map<String, Address> monitoredAddresses;
+    private final Gson gson = new Gson(); // For serializing schedules
 
-    /**
-     * Constructs the database service.
-     *
-     * @param databasePath The path to the SQLite database file (from config).
-     */
-    public DatabaseService(String databasePath) {
-        this.dbUrl = "jdbc:sqlite:" + databasePath;
-        System.out.println("Database service initialized. DB file at: " + databasePath);
+    public DatabaseService(String dbPath, Map<String, Address> addresses) {
+        this.dbUrl = "jdbc:sqlite:" + dbPath;
+        this.monitoredAddresses = addresses;
+        System.out.println("Database service initialized. DB file at: " + dbPath);
     }
 
     /**
-     * Initializes the database by creating all necessary tables if they don't exist.
-     * Also loads the 4 monitored addresses into the 'addresses' table.
-     *
-     * @param addresses The map of addresses from AppConfig.
+     * Initializes the database.
+     * Creates tables if they don't exist and populates the addresses table.
      */
-    public void initDatabase(Map<String, Address> addresses) {
-        // SQL statements to create tables
-        String sqlUsers = "CREATE TABLE IF NOT EXISTS users ("
+    public void initDatabase() {
+        // Automatically create parent directories if they don't exist
+        try {
+            Path dbPath = Paths.get(this.dbUrl.replace("jdbc:sqlite:", ""));
+            Files.createDirectories(dbPath.getParent());
+        } catch (Exception e) {
+            System.err.println("FATAL: Could not create directory for database: " + e.getMessage());
+            throw new RuntimeException("Database initialization failed", e);
+        }
+
+        // SQL statements for table creation
+        String createUsersTable = "CREATE TABLE IF NOT EXISTS users ("
                 + " chat_id INTEGER PRIMARY KEY,"
-                + " first_name TEXT NOT NULL,"
-                + " selected_address_key TEXT,"
-                + " FOREIGN KEY (selected_address_key) REFERENCES addresses(address_key)"
+                + " first_name TEXT,"
+                + " subscribed_address_key TEXT,"
+                + " FOREIGN KEY (subscribed_address_key) REFERENCES addresses (address_key)"
                 + ");";
 
-        String sqlAddresses = "CREATE TABLE IF NOT EXISTS addresses ("
+        String createAddressesTable = "CREATE TABLE IF NOT EXISTS addresses ("
                 + " address_key TEXT PRIMARY KEY,"
-                + " name TEXT NOT NULL,"
-                + " city TEXT NOT NULL,"
-                + " street TEXT NOT NULL,"
-                + " house_num TEXT NOT NULL"
+                + " display_name TEXT NOT NULL"
                 + ");";
 
-        String sqlSchedules = "CREATE TABLE IF NOT EXISTS schedules ("
+        String createCachedSchedulesTable = "CREATE TABLE IF NOT EXISTS cached_schedules ("
                 + " address_key TEXT PRIMARY KEY,"
-                + " schedule_json TEXT,"
-                + " last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
-                + " FOREIGN KEY (address_key) REFERENCES addresses(address_key)"
+                + " schedule_json TEXT," // Can be NULL if not yet scraped
+                + " last_checked INTEGER NOT NULL DEFAULT 0," // Store as Unix timestamp
+                + " FOREIGN KEY (address_key) REFERENCES addresses (address_key)"
                 + ");";
 
-        String sqlWarnedUsers = "CREATE TABLE IF NOT EXISTS warned_users ("
+        // Table to track which user has been warned about which outage
+        String createWarnedUsersTable = "CREATE TABLE IF NOT EXISTS warned_users ("
+                + " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                 + " chat_id INTEGER NOT NULL,"
                 + " address_key TEXT NOT NULL,"
-                + " shutdown_start_time TEXT NOT NULL,"
-                + " PRIMARY KEY (chat_id, address_key, shutdown_start_time),"
-                + " FOREIGN KEY (chat_id) REFERENCES users(chat_id),"
-                + " FOREIGN KEY (address_key) REFERENCES addresses(address_key)"
+                + " outage_start_time TEXT NOT NULL," // e.g., "14:30"
+                + " UNIQUE(chat_id, address_key, outage_start_time)"
                 + ");";
 
         try (Connection conn = DriverManager.getConnection(dbUrl);
              Statement stmt = conn.createStatement()) {
 
-            // Execute table creation
-            stmt.execute(sqlUsers);
-            stmt.execute(sqlAddresses);
-            stmt.execute(sqlSchedules);
-            stmt.execute(sqlWarnedUsers);
+            // Create tables
+            stmt.execute(createUsersTable);
+            stmt.execute(createAddressesTable);
+            stmt.execute(createCachedSchedulesTable);
+            stmt.execute(createWarnedUsersTable);
+
+            // Populate/Update addresses table from config.properties
+            String insertAddressSql = "INSERT OR REPLACE INTO addresses (address_key, display_name) VALUES (?, ?)";
+            String insertScheduleSql = "INSERT OR IGNORE INTO cached_schedules (address_key, schedule_json, last_checked) VALUES (?, ?, 0)";
+
+            try (PreparedStatement psAddr = conn.prepareStatement(insertAddressSql);
+                 PreparedStatement psSched = conn.prepareStatement(insertScheduleSql)) {
+
+                for (Map.Entry<String, Address> entry : monitoredAddresses.entrySet()) {
+                    // Populate addresses
+                    psAddr.setString(1, entry.getKey());
+                    psAddr.setString(2, entry.getValue().name());
+                    psAddr.addBatch();
+
+                    // --- FIX (v4.2.2) ---
+                    // Populate cached_schedules with NULL (unknown), not "[]" (no outages)
+                    // This fixes the bug where new users see "No outages" instead of "Loading..."
+                    psSched.setString(1, entry.getKey());
+                    psSched.setNull(2, Types.VARCHAR);
+                    psSched.addBatch();
+                }
+                psAddr.executeBatch();
+                psSched.executeBatch();
+            }
 
             System.out.println("Database tables checked/created successfully.");
-
-            // Populate/Update the 'addresses' table from config.properties
-            loadAddressesIntoDb(conn, addresses);
+            System.out.println("Successfully loaded/updated " + monitoredAddresses.size() + " addresses into database.");
 
         } catch (SQLException e) {
             System.err.println("FATAL: Failed to initialize database: " + e.getMessage());
+            e.printStackTrace();
             throw new RuntimeException("Database initialization failed", e);
         }
     }
 
     /**
-     * Loads the 4 addresses from the config file into the database.
-     * Uses 'REPLACE INTO' to ensure the data is always up-to-date
-     * with the config file on every application start.
+     * Saves or updates a user's address subscription.
+     *
+     * @param chatId      The user's Telegram Chat ID.
+     * @param addressKey  The address key they subscribed to (e.g., "address.1").
      */
-    private void loadAddressesIntoDb(Connection conn, Map<String, Address> addresses) throws SQLException {
-        String sql = "REPLACE INTO addresses (address_key, name, city, street, house_num) VALUES (?, ?, ?, ?, ?);";
-
-        try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            conn.setAutoCommit(false); // Start transaction
-
-            for (Map.Entry<String, Address> entry : addresses.entrySet()) {
-                Address addr = entry.getValue();
-                pstmt.setString(1, entry.getKey()); // "address_1"
-                pstmt.setString(2, addr.name());
-                pstmt.setString(3, addr.city());
-                pstmt.setString(4, addr.street());
-                pstmt.setString(5, addr.houseNum());
-                pstmt.addBatch();
-            }
-
-            pstmt.executeBatch();
-            conn.commit(); // Commit transaction
-
-            System.out.println("Successfully loaded/updated " + addresses.size() + " addresses into database.");
+    public void setUserAddress(long chatId, String addressKey) {
+        // This method only sets the subscription, not the name.
+        String sql = "INSERT OR REPLACE INTO users (chat_id, subscribed_address_key) "
+                + "VALUES (?, ?) "
+                + "ON CONFLICT(chat_id) DO UPDATE SET subscribed_address_key = excluded.subscribed_address_key";
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setLong(1, chatId);
+            pstmt.setString(2, addressKey);
+            pstmt.executeUpdate();
+            System.out.println("User " + chatId + " subscribed to " + addressKey);
         } catch (SQLException e) {
-            conn.rollback(); // Rollback on error
-            System.err.println("Failed to load addresses into database: " + e.getMessage());
-        } finally {
-            conn.setAutoCommit(true); // Restore default behavior
+            System.err.println("Error setting user address: " + e.getMessage());
         }
     }
 
     /**
-     * Registers a new user or updates their name on /start.
+     * Updates a user's first name.
+     * This is called separately to register or update their name.
+     *
+     * @param chatId    The user's Telegram Chat ID.
+     * @param firstName The user's first name.
      */
-    public void registerUser(long chatId, String firstName) {
-        String sql = "REPLACE INTO users (chat_id, first_name, selected_address_key) VALUES (?, ?, "
-                + "(SELECT selected_address_key FROM users WHERE chat_id = ?));";
-
+    public void updateUserName(long chatId, String firstName) {
+        String sql = "INSERT OR REPLACE INTO users (chat_id, first_name) "
+                + "VALUES (?, ?) "
+                + "ON CONFLICT(chat_id) DO UPDATE SET first_name = excluded.first_name";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setLong(1, chatId);
             pstmt.setString(2, firstName);
-            pstmt.setLong(3, chatId); // For the sub-select
             pstmt.executeUpdate();
         } catch (SQLException e) {
-            System.err.println("Error registering user " + chatId + ": " + e.getMessage());
+            System.err.println("Error updating user name: " + e.getMessage());
         }
     }
 
-    /**
-     * Saves the user's chosen address subscription.
-     */
-    public void setUserAddress(long chatId, String addressKey) {
-        String sql = "UPDATE users SET selected_address_key = ? WHERE chat_id = ?;";
-
-        try (Connection conn = DriverManager.getConnection(dbUrl);
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, addressKey);
-            pstmt.setLong(2, chatId);
-            pstmt.executeUpdate();
-            System.out.println("User " + chatId + " subscribed to " + addressKey);
-        } catch (SQLException e) {
-            System.err.println("Error setting address for user " + chatId + ": " + e.getMessage());
-        }
-    }
 
     /**
-     * Gets all users subscribed to a specific address.
+     * Retrieves all users subscribed to a specific address.
+     *
+     * @param addressKey The address key to check.
+     * @return A list of Chat IDs.
      */
     public List<Long> getUsersForAddress(String addressKey) {
         List<Long> userIds = new ArrayList<>();
-        String sql = "SELECT chat_id FROM users WHERE selected_address_key = ?;";
-
+        String sql = "SELECT chat_id FROM users WHERE subscribed_address_key = ?";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, addressKey);
-
-            try (ResultSet rs = pstmt.executeQuery()) {
-                while (rs.next()) {
-                    userIds.add(rs.getLong("chat_id"));
-                }
+            ResultSet rs = pstmt.executeQuery();
+            while (rs.next()) {
+                userIds.add(rs.getLong("chat_id"));
             }
         } catch (SQLException e) {
-            System.err.println("Error getting users for address " + addressKey + ": " + e.getMessage());
+            System.err.println("Error getting users for address: " + e.getMessage());
         }
         return userIds;
     }
 
     /**
-     * Saves the latest schedule for an address.
-     * The schedule list is serialized to a JSON string.
+     * Saves a new schedule to the database cache as a JSON string.
+     *
+     * @param addressKey The address key.
+     * @param schedule   The list of TimeIntervals to save.
      */
     public void saveSchedule(String addressKey, List<TimeInterval> schedule) {
-        String sql = "REPLACE INTO schedules (address_key, schedule_json, last_checked) VALUES (?, ?, CURRENT_TIMESTAMP);";
-        String scheduleJson = gson.toJson(schedule); // Serialize to JSON
-
+        String scheduleJson = gson.toJson(schedule);
+        String sql = "UPDATE cached_schedules SET schedule_json = ?, last_checked = ? WHERE address_key = ?";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, addressKey);
-            pstmt.setString(2, scheduleJson);
+            pstmt.setString(1, scheduleJson);
+            pstmt.setLong(2, System.currentTimeMillis() / 1000L); // Current Unix time
+            pstmt.setString(3, addressKey);
             pstmt.executeUpdate();
         } catch (SQLException e) {
-            System.err.println("Error saving schedule for " + addressKey + ": " + e.getMessage());
+            System.err.println("Error saving schedule to cache: " + e.getMessage());
         }
     }
 
     /**
-     * Gets the last saved schedule (as a JSON string) for an address.
-     * NotificationService will be responsible for deserializing this JSON.
+     * Retrieves the last cached schedule (as a JSON string) for an address.
+     *
+     * @param addressKey The address key.
+     * @return The schedule as a JSON string, or null if not found.
      */
     public String getSchedule(String addressKey) {
-        String sql = "SELECT schedule_json FROM schedules WHERE address_key = ?;";
-
+        String sql = "SELECT schedule_json FROM cached_schedules WHERE address_key = ?";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, addressKey);
-
-            try (ResultSet rs = pstmt.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getString("schedule_json");
-                }
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getString("schedule_json");
             }
         } catch (SQLException e) {
-            System.err.println("Error getting schedule for " + addressKey + ": " + e.getMessage());
+            System.err.println("Error getting schedule from cache: " + e.getMessage());
         }
-        return null; // Return null if no schedule is found
+        return null;
     }
 
     /**
-     * Gets users for an address who have *not* yet been warned about a specific shutdown.
+     * Finds users who are subscribed to an address AND have not yet been warned
+     * about a specific upcoming outage.
+     *
+     * @param addressKey     The address key.
+     * @param outageStartTime The start time of the outage (e.g., "14:30").
+     * @return A list of Chat IDs to warn.
      */
-    public List<Long> getUsersToWarn(String addressKey, String startTime) {
+    public List<Long> getUsersToWarn(String addressKey, String outageStartTime) {
         List<Long> userIds = new ArrayList<>();
-        // SQL finds users subscribed to the address (in 'users')
-        // who are NOT in the 'warned_users' table for this specific address/time.
+        // SQL JOIN to find users who (are subscribed) AND (are NOT in the warned_users table for this outage)
         String sql = "SELECT u.chat_id FROM users u "
-                + "LEFT JOIN warned_users w ON u.chat_id = w.chat_id "
-                + "AND w.address_key = ? AND w.shutdown_start_time = ? "
-                + "WHERE u.selected_address_key = ? AND w.chat_id IS NULL;";
+                + " LEFT JOIN warned_users w ON u.chat_id = w.chat_id "
+                + " AND w.address_key = ? AND w.outage_start_time = ? "
+                + " WHERE u.subscribed_address_key = ? AND w.id IS NULL";
 
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, addressKey);
-            pstmt.setString(2, startTime);
+            pstmt.setString(2, outageStartTime);
             pstmt.setString(3, addressKey);
-
-            try (ResultSet rs = pstmt.executeQuery()) {
-                while (rs.next()) {
-                    userIds.add(rs.getLong("chat_id"));
-                }
+            ResultSet rs = pstmt.executeQuery();
+            while (rs.next()) {
+                userIds.add(rs.getLong("chat_id"));
             }
         } catch (SQLException e) {
-            System.err.println("Error in getUsersToWarn for " + addressKey + ": " + e.getMessage());
+            System.err.println("Error getting users to warn: " + e.getMessage());
         }
         return userIds;
     }
 
     /**
-     * Marks a list of users as "warned" for a specific shutdown time
-     * to prevent spamming them.
+     * Marks a list of users as "warned" for a specific outage to prevent spam.
+     *
+     * @param userIds         The list of users to mark.
+     * @param addressKey      The address key.
+     * @param outageStartTime The start time of the outage (e.g., "14:30").
      */
-    public void markUsersAsWarned(List<Long> userIds, String addressKey, String startTime) {
-        String sql = "REPLACE INTO warned_users (chat_id, address_key, shutdown_start_time) VALUES (?, ?, ?);";
-
+    public void markUsersAsWarned(List<Long> userIds, String addressKey, String outageStartTime) {
+        String sql = "INSERT OR IGNORE INTO warned_users (chat_id, address_key, outage_start_time) VALUES (?, ?, ?)";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
 
-            conn.setAutoCommit(false); // Start transaction
             for (Long chatId : userIds) {
                 pstmt.setLong(1, chatId);
                 pstmt.setString(2, addressKey);
-                pstmt.setString(3, startTime);
+                pstmt.setString(3, outageStartTime);
                 pstmt.addBatch();
             }
             pstmt.executeBatch();
-            conn.commit(); // Commit transaction
-
+            System.out.println("Marked " + userIds.size() + " users as warned for " + addressKey + " at " + outageStartTime);
         } catch (SQLException e) {
-            System.err.println("Error in markUsersAsWarned: " + e.getMessage());
+            System.err.println("Error marking users as warned: " + e.getMessage());
         }
     }
 
     /**
-     * Clears all "warned" flags for a specific address.
-     * This is called when the schedule changes.
+     * Clears all warning flags for a given address.
+     * This is called when the schedule changes, so users can be re-warned about new times.
+     *
+     * @param addressKey The address key to clear.
      */
     public void clearWarnedFlags(String addressKey) {
-        String sql = "DELETE FROM warned_users WHERE address_key = ?;";
-
+        String sql = "DELETE FROM warned_users WHERE address_key = ?";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, addressKey);
             int rowsAffected = pstmt.executeUpdate();
             System.out.println("Cleared " + rowsAffected + " warned flags for address " + addressKey + " due to schedule change.");
         } catch (SQLException e) {
-            System.err.println("Error in clearWarnedFlags: " + e.getMessage());
+            System.err.println("Error clearing warned flags: " + e.getMessage());
         }
     }
 }
