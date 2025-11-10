@@ -2,6 +2,7 @@ package ua.com.dtek.scraper.service;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import ua.com.dtek.scraper.DtekScraperBot;
 import ua.com.dtek.scraper.dto.Address;
 import ua.com.dtek.scraper.dto.TimeInterval;
@@ -10,6 +11,7 @@ import ua.com.dtek.scraper.parser.ScheduleParser;
 import java.lang.reflect.Type;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -18,17 +20,21 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+// --- MEMORY LEAK FIX (v4.3.0) ---
+// Import closeWebDriver to fix resource leak
+import static com.codeborne.selenide.Selenide.closeWebDriver;
+// --- END FIX ---
+
 /**
  * Handles all background monitoring tasks.
  * This service runs in scheduled threads and is responsible for:
- * 1. Checking for schedule changes every hour.
+ * 1. Checking for schedule changes every 30 minutes.
  * 2. Sending pre-shutdown warnings 30 minutes before an outage.
  *
- * @version 4.1.0
+ * @version 4.3.0
  */
 public class NotificationService {
 
-    // (FIX 2) Define TIME_FORMATTER locally as it's needed for logging
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
 
     private final DatabaseService dbService;
@@ -53,11 +59,11 @@ public class NotificationService {
      */
     public NotificationService(DatabaseService dbService,
                                DtekScraperService scraperService,
-                               ScheduleParser parser, // (FIX 1) Inject parser
+                               ScheduleParser parser,
                                Map<String, Address> addresses) {
         this.dbService = dbService;
         this.scraperService = scraperService;
-        this.scheduleParser = parser; // (FIX 1) Assign parser
+        this.scheduleParser = parser;
         this.monitoredAddresses = addresses;
     }
 
@@ -74,9 +80,9 @@ public class NotificationService {
     public void startMonitoring() {
         System.out.println("Starting background monitoring tasks...");
 
-        // --- CHANGE (v4.1.0) ---
-        // Task 1: Check for schedule changes (every 30 minutes, at minute 2 and 32)
-        // We run at a weird minute to avoid peak load on DTEK's servers
+        // --- FUNCTIONALITY CHANGE (v4.1.0) ---
+        // Task 1: Check for schedule changes (every 30 minutes)
+        // We run at a weird minute (2) to avoid peak load on DTEK's servers
         scheduler.scheduleAtFixedRate(this::runHourlyCheck, 2, 30, TimeUnit.MINUTES);
         // --- END CHANGE ---
 
@@ -90,45 +96,58 @@ public class NotificationService {
     private void runHourlyCheck() {
         System.out.println("\n[SCHEDULE CHECK] Running schedule change check...");
 
-        for (Map.Entry<String, Address> entry : monitoredAddresses.entrySet()) {
-            String addressKey = entry.getKey();
-            Address address = entry.getValue();
-            System.out.println("[SCHEDULE CHECK] Checking address: " + address.name());
+        // --- MEMORY LEAK FIX (v4.3.0) ---
+        // We wrap the entire scraping logic in a try/finally
+        // to ensure the browser ALWAYS closes, even if one check fails.
+        try {
+            for (Map.Entry<String, Address> entry : monitoredAddresses.entrySet()) {
+                String addressKey = entry.getKey();
+                Address address = entry.getValue();
+                System.out.println("[SCHEDULE CHECK] Checking address: " + address.name());
 
-            try {
-                // 1. Get the new schedule from the website
-                List<TimeInterval> newSchedule = scraperService.getShutdownSchedule(
-                        address.city(), address.street(), address.houseNum()
-                );
+                try {
+                    // 1. Get the new schedule from the website
+                    List<TimeInterval> newSchedule = scraperService.getShutdownSchedule(
+                            address.city(), address.street(), address.houseNum()
+                    );
 
-                // 2. Get the old schedule from our database
-                String oldScheduleJson = dbService.getSchedule(addressKey);
-                List<TimeInterval> oldSchedule = (oldScheduleJson == null)
-                        ? Collections.emptyList()
-                        : gson.fromJson(oldScheduleJson, scheduleListType);
+                    // 2. Get the old schedule from our database
+                    String oldScheduleJson = dbService.getSchedule(addressKey);
+                    List<TimeInterval> oldSchedule = (oldScheduleJson == null)
+                            ? Collections.emptyList()
+                            : gson.fromJson(oldScheduleJson, scheduleListType);
 
-                // 3. Compare
-                if (!oldSchedule.equals(newSchedule)) {
-                    System.out.println("[SCHEDULE CHECK] CHANGES DETECTED for " + address.name());
+                    // 3. Compare
+                    if (!oldSchedule.equals(newSchedule)) {
+                        System.out.println("[SCHEDULE CHECK] CHANGES DETECTED for " + address.name());
 
-                    // 4. Save the new schedule
-                    dbService.saveSchedule(addressKey, newSchedule);
+                        // 4. Save the new schedule
+                        dbService.saveSchedule(addressKey, newSchedule);
 
-                    // 5. Notify all subscribed users
-                    notifyUsersOfChange(addressKey, address.name(), newSchedule, oldSchedule);
+                        // 5. Notify all subscribed users
+                        notifyUsersOfChange(addressKey, address.name(), newSchedule, oldSchedule);
 
-                    // 6. Clear old warning flags (so they can be warned about new times)
-                    dbService.clearWarnedFlags(addressKey);
-                } else {
-                    System.out.println("[SCHEDULE CHECK] No changes for " + address.name());
+                        // 6. Clear old warning flags (so they can be warned about new times)
+                        dbService.clearWarnedFlags(addressKey);
+                    } else {
+                        System.out.println("[SCHEDULE CHECK] No changes for " + address.name());
+                    }
+
+                } catch (RuntimeException e) {
+                    // This catches the RuntimeException from ScheduleParser (v4.0.2)
+                    // or Selenide errors
+                    System.err.println("[SCHEDULE CHECK] CRITICAL FAILURE for " + address.name() + ": " + e.getMessage());
+                    // We DO NOT send a notification and DO NOT update the cache
+                    // This prevents "silent failures" from wiping the schedule
                 }
-
-            } catch (RuntimeException e) {
-                // This catches the RuntimeException from ScheduleParser (v4.0.2)
-                System.err.println("[SCHEDULE CHECK] CRITICAL FAILURE for " + address.name() + ": " + e.getMessage());
-                // We DO NOT send a notification and DO NOT update the cache
-                // This prevents "silent failures" from wiping the schedule
             }
+        } finally {
+            // --- MEMORY LEAK FIX (v4.3.0) ---
+            // After ALL 4 addresses are checked, close the browser
+            // to free up server resources (RAM/CPU).
+            closeWebDriver();
+            System.out.println("[SCHEDULE CHECK] Browser closed. Resources freed.");
+            // --- END FIX ---
         }
     }
 
@@ -175,46 +194,76 @@ public class NotificationService {
         String now = LocalTime.now().format(TIME_FORMATTER);
         System.out.println("\n[PRE-WARN CHECK] Running pre-shutdown warning check at " + now);
 
+        // --- MEMORY LEAK FIX (v4.3.0) ---
+        // We need to check if ANYONE needs a warning first,
+        // so we don't open the browser for no reason.
+
+        // 1. Find all addresses that have upcoming shutdowns
+        List<String> addressesWithUpcomingShutdowns = new ArrayList<>();
         for (String addressKey : monitoredAddresses.keySet()) {
-            // 1. Get the current schedule from our DB
             String scheduleJson = dbService.getSchedule(addressKey);
-            if (scheduleJson == null) continue; // No schedule cached for this address
+            if (scheduleJson == null) continue; // No schedule
 
             List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
-            if (schedule.isEmpty()) continue; // No shutdowns planned
+            if (schedule.isEmpty()) continue; // No shutdowns
 
-            // 2. Find shutdowns starting in the next 30-40 mins
-            // (FIX) Call with one argument
-            List<TimeInterval> upcomingShutdowns = scheduleParser.findUpcomingShutdowns(schedule);
-            if (upcomingShutdowns.isEmpty()) continue;
-
-            // --- FIX ---
-            // Changed 'appConfig.getAddresses()' to the correct local field 'monitoredAddresses'
-            String addressName = monitoredAddresses.get(addressKey).name();
-            // --- END FIX ---
-
-            for (TimeInterval interval : upcomingShutdowns) {
-                String startTime = interval.startTime();
-                System.out.println("[PRE-WARN] Found upcoming shutdown for " + addressKey + " at " + startTime);
-
-                // 3. Find users who are subscribed AND haven't been warned yet
-                List<Long> usersToWarn = dbService.getUsersToWarn(addressKey, startTime);
-                if (usersToWarn.isEmpty()) continue; // Everyone already warned
-
-                System.out.println("[NOTIFY] Sending pre-warn notification to " + usersToWarn.size() + " users for " + addressKey);
-
-                // 4. Send the warning
-                String message = "❗️ *Увага! Попередження!*\n\n" +
-                        "За вашою адресою (*" + addressName + "*)\n" +
-                        "планується відключення о `" + startTime + "`.";
-
-                for (Long chatId : usersToWarn) {
-                    bot.sendMessage(chatId, message);
-                }
-
-                // 5. Mark these users as "warned" to prevent spam
-                dbService.markUsersAsWarned(usersToWarn, addressKey, startTime);
+            // (v4.2.2 fix: call with one argument)
+            List<TimeInterval> upcoming = scheduleParser.findUpcomingShutdowns(schedule);
+            if (!upcoming.isEmpty()) {
+                addressesWithUpcomingShutdowns.add(addressKey);
             }
+        }
+
+        // If no addresses have upcoming shutdowns, we can skip this check
+        // and avoid opening the browser.
+        if (addressesWithUpcomingShutdowns.isEmpty()) {
+            System.out.println("[PRE-WARN CHECK] No upcoming shutdowns found for any address. Skipping.");
+            return;
+        }
+
+        // 2. Now we run the check, but ONLY for the addresses we identified
+        // We wrap this in try/finally to close the browser
+        try {
+            for (String addressKey : addressesWithUpcomingShutdowns) {
+                // We re-fetch the schedule from the DB
+                String scheduleJson = dbService.getSchedule(addressKey);
+                List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
+
+                // We re-calculate the upcoming shutdowns
+                List<TimeInterval> upcomingShutdowns = scheduleParser.findUpcomingShutdowns(schedule);
+
+                // (v4.2.2 fix: use monitoredAddresses map, not appConfig)
+                String addressName = monitoredAddresses.get(addressKey).name();
+
+                for (TimeInterval interval : upcomingShutdowns) {
+                    String startTime = interval.startTime();
+                    System.out.println("[PRE-WARN] Found upcoming shutdown for " + addressKey + " at " + startTime);
+
+                    // 3. Find users who are subscribed AND haven't been warned yet
+                    List<Long> usersToWarn = dbService.getUsersToWarn(addressKey, startTime);
+                    if (usersToWarn.isEmpty()) continue; // Everyone already warned
+
+                    System.out.println("[NOTIFY] Sending pre-warn notification to " + usersToWarn.size() + " users for " + addressKey);
+
+                    // 4. Send the warning
+                    String message = "❗️ *Увага! Попередження!*\n\n" +
+                            "За вашою адресою (*" + addressName + "*)\n" +
+                            "планується відключення о `" + startTime + "`.";
+
+                    for (Long chatId : usersToWarn) {
+                        bot.sendMessage(chatId, message);
+                    }
+
+                    // 5. Mark these users as "warned" to prevent spam
+                    dbService.markUsersAsWarned(usersToWarn, addressKey, startTime);
+                }
+            }
+        } finally {
+            // --- MEMORY LEAK FIX (v4.3.0) ---
+            // Close the browser after checking all relevant addresses
+            closeWebDriver();
+            System.out.println("[PRE-WARN CHECK] Browser closed. Resources freed.");
+            // --- END FIX ---
         }
     }
 }

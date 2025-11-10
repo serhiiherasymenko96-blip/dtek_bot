@@ -24,22 +24,17 @@ import ua.com.dtek.scraper.service.DatabaseService;
 import ua.com.dtek.scraper.service.DtekScraperService;
 import ua.com.dtek.scraper.service.NotificationService;
 
-// --- FIX 1 ---
-// Added missing imports for Instant and Duration
 import java.time.Duration;
 import java.time.Instant;
-// --- END FIX ---
-
 import java.lang.reflect.Type;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
  * Main entry point and the Telegram Bot class.
  *
- * @author Serhii Herasymenko
- * @version 4.2.3 (Fixes compilation errors)
+ * @author Serhii Herasymenko (Updated by Senior Dev)
+ * @version 4.3.0 (Fixes memory leak)
  */
 public class DtekScraperBot extends TelegramLongPollingBot {
 
@@ -64,7 +59,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
     public static void main(String[] args) {
         Instant start = Instant.now();
-        System.out.println("Starting DTEK Scraper Bot Service (v4.2.3)...");
+        System.out.println("Starting DTEK Scraper Bot Service (v4.3.0)...");
 
         try {
             // 1. Load application configuration
@@ -75,14 +70,12 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             BrowserConfig.setupSelenide();
 
             // 3. Initialize Database Service
-            // (Uses 2-argument constructor)
             DatabaseService dbService = new DatabaseService(
                     config.getDatabasePath(),
                     config.getAddresses()
             );
 
             // 4. Initialize Database
-            // (Uses 0-argument initDatabase)
             dbService.initDatabase();
 
             // 5. Initialize other services
@@ -112,6 +105,12 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             e.printStackTrace();
             System.exit(1); // Exit if startup fails
         }
+        // --- MEMORY LEAK FIX (v4.3.0) ---
+        // We DO NOT call closeWebDriver() here anymore.
+        // The bot is a long-running service.
+        // NotificationService is now responsible for closing the browser
+        // after its scheduled tasks.
+        // --- END FIX ---
     }
 
     @Override
@@ -151,12 +150,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         Map<String, Address> addresses = appConfig.getAddresses();
 
         for (Map.Entry<String, Address> entry : addresses.entrySet()) {
-
-            // --- FIX 2 ---
-            // The method is 'keyboardRow', not 'row'
             keyboardBuilder.keyboardRow(List.of(
-                    // --- END FIX ---
-
                     InlineKeyboardButton.builder()
                             .text(entry.getValue().name())
                             .callbackData(entry.getKey()) // e.g., "address.1"
@@ -192,12 +186,10 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             return;
         }
 
-        // --- FIX 3 & 4 ---
         // 3. Save the user's choice to the database
-        // (Call the two methods that now exist in DatabaseService v4.2.3)
         dbService.setUserAddress(chatId, addressKey);
         dbService.updateUserName(chatId, user.getFirstName());
-        // --- END FIX ---
+        // (v4.2.1 bug fix: we no longer log "subscribed" here, removed duplicate log)
 
         // 4. Get the *current* cached schedule from the DB
         String scheduleJson = dbService.getSchedule(addressKey);
@@ -205,12 +197,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         // 5. Build the confirmation message
         EditMessageText editedMessage = new EditMessageText();
         editedMessage.setChatId(Long.toString(chatId)); // Use Long.toString
-
-        // --- FIX 5 ---
-        // 'messageId' is a primitive 'long', it must be cast to 'int'
-        editedMessage.setMessageId((int) messageId);
-        // --- END FIX ---
-
+        editedMessage.setMessageId((int) messageId); // Cast long to int
         editedMessage.setParseMode("Markdown");
 
         StringBuilder textBuilder = new StringBuilder();
