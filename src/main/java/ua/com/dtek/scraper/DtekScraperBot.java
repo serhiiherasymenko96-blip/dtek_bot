@@ -1,5 +1,9 @@
 package ua.com.dtek.scraper;
 
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import java.lang.reflect.Type;
+
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -11,11 +15,16 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 import ua.com.dtek.scraper.config.AppConfig;
 import ua.com.dtek.scraper.dto.Address;
+import ua.com.dtek.scraper.dto.TimeInterval;
 import ua.com.dtek.scraper.service.DatabaseService;
 import ua.com.dtek.scraper.service.DtekScraperService;
 import ua.com.dtek.scraper.service.NotificationService;
 import ua.com.dtek.scraper.parser.ScheduleParser;
 import ua.com.dtek.scraper.config.BrowserConfig;
+
+// --- NEW IMPORT (v4.2.1) ---
+import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
+// --- END NEW IMPORT ---
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,14 +39,20 @@ import java.util.Map;
  * 3. Handling incoming user commands (like /start) and button clicks.
  * 4. Initializing and starting the background monitoring services.
  *
- * @author Serhii Herasymenko (Updated by Senior Dev)
- * @version 4.0.0
+ * @author Serhii Herasymenko
+ * @version 4.2.1
  */
 public class DtekScraperBot extends TelegramLongPollingBot {
 
     private final AppConfig appConfig;
     private final DatabaseService dbService;
     private final NotificationService notificationService;
+
+    // --- NEW (v4.2.0) ---
+    // Added Gson and Type to deserialize schedules from DB on user request
+    private final Gson gson = new Gson();
+    private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
+    // --- END NEW ---
 
     public DtekScraperBot(AppConfig appConfig, DatabaseService dbService, NotificationService notificationService) {
         super(appConfig.getBotToken());
@@ -160,11 +175,23 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
     /**
      * Handles button clicks (CallbackQuery).
+     *
+     * v4.2.1 Update: Added AnswerCallbackQuery to prevent duplicate client requests.
      */
     private void handleCallbackQuery(org.telegram.telegrambots.meta.api.objects.CallbackQuery callbackQuery) throws TelegramApiException {
         long chatId = callbackQuery.getMessage().getChatId();
         long messageId = callbackQuery.getMessage().getMessageId();
-        String addressKey = callbackQuery.getData(); // e.g., "address_1"
+        String addressKey = callbackQuery.getData(); // e.g., "address.1"
+        String callbackQueryId = callbackQuery.getId();
+
+        // --- FIX (v4.2.1) ---
+        // 1. Immediately answer the callback query.
+        // This stops the "loading" spinner on the user's client
+        // and prevents Telegram from re-sending the same query.
+        AnswerCallbackQuery answer = new AnswerCallbackQuery();
+        answer.setCallbackQueryId(callbackQueryId);
+        execute(answer);
+        // --- END FIX ---
 
         System.out.println("User " + chatId + " selected address key: " + addressKey);
 
@@ -177,13 +204,25 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
         // 2. Save the user's choice to the database
         dbService.setUserAddress(chatId, addressKey);
+        System.out.println("User " + chatId + " subscribed to " + addressKey);
 
-        // 3. Send a confirmation message by editing the original message
-        String confirmationText = "✅ Чудово!\n\n" +
-                "Ви підписалися на сповіщення для адреси:\n" +
-                "**" + selectedAddress.name() + "**\n\n" +
-                "Я повідомлю, коли з'являться зміни у графіку, а також за 30 хвилин до відключення.";
+        // --- NEW LOGIC (v4.2.0) ---
 
+        // 3. Get the most recent schedule from our *own* database (fast!)
+        String scheduleJson = dbService.getSchedule(addressKey);
+        List<TimeInterval> schedule = null;
+        if (scheduleJson != null) {
+            schedule = gson.fromJson(scheduleJson, scheduleListType);
+        }
+
+        // 4. Build the confirmation message *with* the current schedule
+        String confirmationText = "✅ *Чудово! Ви підписалися на адресу:*\n" +
+                "*" + selectedAddress.name() + "*\n\n" +
+                formatScheduleForMessage(schedule); // Use new helper to format the schedule
+
+        // --- END NEW LOGIC ---
+
+        // 5. Send a confirmation message by editing the original message
         EditMessageText editMessage = new EditMessageText();
         editMessage.setChatId(String.valueOf(chatId));
         editMessage.setMessageId((int) messageId);
@@ -192,6 +231,32 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         editMessage.setReplyMarkup(null); // Remove buttons
 
         execute(editMessage);
+    }
+
+    /**
+     * NEW (v4.2.0)
+     * Helper method to format a schedule list into a human-readable string for a message.
+     *
+     * @param schedule The schedule list (can be null or empty).
+     * @return A formatted string.
+     */
+    private String formatScheduleForMessage(List<TimeInterval> schedule) {
+        if (schedule == null) {
+            // Case 1: Bot has just started, no schedule scraped yet.
+            return "Обробка запиту...\n_Поточний графік буде завантажено та показано тут протягом 30 хвилин._";
+        }
+
+        if (schedule.isEmpty()) {
+            // Case 2: We scraped, and there are no shutdowns.
+            return "💡 *Поточний графік:*\nВідключень на сьогодні не заплановано.";
+        }
+
+        // Case 3: We have a schedule.
+        StringBuilder sb = new StringBuilder("💡 *Поточний графік:*\n");
+        for (TimeInterval interval : schedule) {
+            sb.append("•  `").append(interval.startTime()).append(" - ").append(interval.endTime()).append("`\n");
+        }
+        return sb.toString();
     }
 
     /**

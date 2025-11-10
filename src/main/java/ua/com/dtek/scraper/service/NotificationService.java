@@ -9,7 +9,8 @@ import ua.com.dtek.scraper.parser.ScheduleParser;
 
 import java.lang.reflect.Type;
 import java.time.LocalTime;
-import java.time.format.DateTimeFormatter; // <-- (FIX 2) ADD THIS IMPORT
+import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -18,54 +19,50 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
- * Service responsible for background monitoring tasks.
- * It schedules hourly checks for schedule changes and 10-minute checks
- * for pre-shutdown warnings.
- * <p>
- * v4.0.1: Updated to use Gson for schedule deserialization.
+ * Handles all background monitoring tasks.
+ * This service runs in scheduled threads and is responsible for:
+ * 1. Checking for schedule changes every hour.
+ * 2. Sending pre-shutdown warnings 30 minutes before an outage.
+ *
+ * @version 4.1.0
  */
 public class NotificationService {
 
-    // Schedulers for background tasks
-    private final ScheduledExecutorService hourlyScheduler = Executors.newSingleThreadScheduledExecutor();
-    private final ScheduledExecutorService warningScheduler = Executors.newSingleThreadScheduledExecutor();
-
-    // Injected services
-    private final DatabaseService dbService;
-    private final DtekScraperService scraperService;
-    private final ScheduleParser scheduleParser; // We get this from the scraperService
-    private final Map<String, Address> addresses; // All addresses from config
-    private DtekScraperBot bot; // Reference to the bot to send messages
-
-    // (FIX 2) ADD THIS CONSTANT
+    // (FIX 2) Define TIME_FORMATTER locally as it's needed for logging
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
 
-    // Gson instance and Type for (de)serializing List<TimeInterval>
-    private final Gson gson = new Gson();
+    private final DatabaseService dbService;
+    private final DtekScraperService scraperService;
+    private final ScheduleParser scheduleParser;
+    private final Map<String, Address> monitoredAddresses;
+    private final Gson gson = new Gson(); // For deserializing JSON from DB
     private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
+
+    // A single-threaded scheduler for all background tasks
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    private DtekScraperBot bot; // Reference to the bot to send messages
 
     /**
      * Constructs the notification service.
      *
      * @param dbService      The database service.
      * @param scraperService The scraping service.
-     * @param scheduleParser The schedule parser (FIX 1: Injected)
-     * @param addresses      The map of all monitored addresses.
+     * @param parser         The schedule parser.
+     * @param addresses      The map of monitored addresses.
      */
-    // (FIX 1) ADD 'ScheduleParser scheduleParser' to the constructor
-    public NotificationService(DatabaseService dbService, DtekScraperService scraperService, ScheduleParser scheduleParser, Map<String, Address> addresses) {
+    public NotificationService(DatabaseService dbService,
+                               DtekScraperService scraperService,
+                               ScheduleParser parser, // (FIX 1) Inject parser
+                               Map<String, Address> addresses) {
         this.dbService = dbService;
         this.scraperService = scraperService;
-        this.addresses = addresses;
-        // (FIX 1) Use the injected parser
-        this.scheduleParser = scheduleParser;
+        this.scheduleParser = parser; // (FIX 1) Assign parser
+        this.monitoredAddresses = addresses;
     }
 
     /**
-     * Injects the bot instance (using setter-injection) after the bot is created,
-     * so this service can send messages.
-     *
-     * @param bot The main bot instance.
+     * Sets the bot instance. Must be called after the bot is created.
      */
     public void setBot(DtekScraperBot bot) {
         this.bot = bot;
@@ -77,169 +74,147 @@ public class NotificationService {
     public void startMonitoring() {
         System.out.println("Starting background monitoring tasks...");
 
-        // Task 1: Check for schedule *changes* every hour, starting 5 minutes from now
-        hourlyScheduler.scheduleAtFixedRate(this::runHourlyCheck, 5, 60, TimeUnit.MINUTES);
+        // --- CHANGE (v4.1.0) ---
+        // Task 1: Check for schedule changes (every 30 minutes, at minute 2 and 32)
+        // We run at a weird minute to avoid peak load on DTEK's servers
+        scheduler.scheduleAtFixedRate(this::runHourlyCheck, 2, 30, TimeUnit.MINUTES);
+        // --- END CHANGE ---
 
-        // Task 2: Check for *upcoming* shutdowns every 10 minutes, starting 1 minute from now
-        warningScheduler.scheduleAtFixedRate(this::runPreShutdownWarningCheck, 1, 10, TimeUnit.MINUTES);
+        // Task 2: Check for pre-shutdown warnings (every 10 minutes)
+        scheduler.scheduleAtFixedRate(this::runPreShutdownWarningCheck, 1, 10, TimeUnit.MINUTES);
     }
 
     /**
-     * TASK 1: Runs every hour to check all configured addresses for schedule changes.
-     * Implements user requirement #1.
+     * Task 1: Runs every 30 minutes to check all 4 addresses for schedule changes.
      */
     private void runHourlyCheck() {
-        System.out.println("\n[HOURLY CHECK] Running hourly schedule change check...");
-        if (bot == null) {
-            System.err.println("[HOURLY CHECK] Bot is not set (yet?). Skipping check.");
-            return;
-        }
+        System.out.println("\n[SCHEDULE CHECK] Running schedule change check...");
 
-        // Check every address defined in config.properties
-        for (Map.Entry<String, Address> entry : addresses.entrySet()) {
+        for (Map.Entry<String, Address> entry : monitoredAddresses.entrySet()) {
             String addressKey = entry.getKey();
             Address address = entry.getValue();
+            System.out.println("[SCHEDULE CHECK] Checking address: " + address.name());
 
             try {
-                System.out.println("[HOURLY CHECK] Checking address: " + address.name());
-                // 1. Get new schedule from DTEK (this is a live web scrape)
+                // 1. Get the new schedule from the website
                 List<TimeInterval> newSchedule = scraperService.getShutdownSchedule(
-                        address.city(),
-                        address.street(),
-                        address.houseNum()
+                        address.city(), address.street(), address.houseNum()
                 );
 
-                // 2. Get old schedule from DB
+                // 2. Get the old schedule from our database
                 String oldScheduleJson = dbService.getSchedule(addressKey);
-                List<TimeInterval> oldSchedule = gson.fromJson(oldScheduleJson, scheduleListType);
+                List<TimeInterval> oldSchedule = (oldScheduleJson == null)
+                        ? Collections.emptyList()
+                        : gson.fromJson(oldScheduleJson, scheduleListType);
 
-                // 3. Compare (Note: List.equals() works correctly for records)
-                if (oldSchedule == null || !oldSchedule.equals(newSchedule)) {
-                    System.out.println("[HOURLY CHECK] CHANGES DETECTED for " + address.name());
+                // 3. Compare
+                if (!oldSchedule.equals(newSchedule)) {
+                    System.out.println("[SCHEDULE CHECK] CHANGES DETECTED for " + address.name());
 
-                    // 4. Save new schedule to DB (as JSON)
+                    // 4. Save the new schedule
                     dbService.saveSchedule(addressKey, newSchedule);
 
-                    // 5. Notify subscribed users
-                    notifyUsersOfChange(addressKey, newSchedule);
+                    // 5. Notify all subscribed users
+                    notifyUsersOfChange(addressKey, address.name(), newSchedule, oldSchedule);
+
+                    // 6. Clear old warning flags (so they can be warned about new times)
+                    dbService.clearWarnedFlags(addressKey);
                 } else {
-                    System.out.println("[HOURLY CHECK] No changes for " + address.name());
-                    // 6. Notify users that there are NO changes (as requested)
-                    notifyUsersOfNoChange(addressKey);
+                    System.out.println("[SCHEDULE CHECK] No changes for " + address.name());
                 }
-            } catch (Exception e) {
-                // Catch exceptions per-address so one failed scrape doesn't stop the whole loop
-                System.err.println("[HOURLY CHECK] Failed to check address " + address.name() + ": " + e.getMessage());
-                e.printStackTrace();
+
+            } catch (RuntimeException e) {
+                // This catches the RuntimeException from ScheduleParser (v4.0.2)
+                System.err.println("[SCHEDULE CHECK] CRITICAL FAILURE for " + address.name() + ": " + e.getMessage());
+                // We DO NOT send a notification and DO NOT update the cache
+                // This prevents "silent failures" from wiping the schedule
             }
         }
     }
 
     /**
-     * TASK 2: Runs every 10 minutes to check for shutdowns starting soon.
-     * Implements user requirement #2.
+     * Helper to format and send the "schedule changed" notification.
      */
-    private void runPreShutdownWarningCheck() {
-        LocalTime now = LocalTime.now();
-        // This check runs every 10 minutes (e.g., at 14:00, 14:10, 14:20...)
-        // The parser logic (findUpcomingShutdowns) looks for shutdowns
-        // starting between 29 and 40 minutes from 'now'.
-        // Example:
-        // - Run at 14:20 -> Window is 14:49-15:00 -> Catches 15:00 shutdown.
-        // - Run at 14:00 -> Window is 14:29-14:40 -> Catches 14:30 shutdown.
+    private void notifyUsersOfChange(String addressKey, String addressName, List<TimeInterval> newSchedule, List<TimeInterval> oldSchedule) {
+        if (bot == null) return; // Bot not ready
 
-        System.out.println("\n[PRE-WARN CHECK] Running pre-shutdown warning check at " + now.format(TIME_FORMATTER));
-        if (bot == null) {
-            System.err.println("[PRE-WARN CHECK] Bot is not set. Skipping check.");
-            return;
-        }
+        List<Long> userIds = dbService.getUsersForAddress(addressKey);
+        System.out.println("[NOTIFY] Sending change notification to " + userIds.size() + " users for " + addressKey);
+        if (userIds.isEmpty()) return;
 
-        for (String addressKey : addresses.keySet()) {
-            try {
-                // 1. Get current schedule from DB (fast, no scrape)
-                String currentScheduleJson = dbService.getSchedule(addressKey);
-                if (currentScheduleJson == null || currentScheduleJson.isEmpty()) {
-                    continue; // No schedule for this address
-                }
-
-                List<TimeInterval> schedule = gson.fromJson(currentScheduleJson, scheduleListType);
-
-                // 2. Check for upcoming shutdowns using the parser's logic
-                List<TimeInterval> upcoming = scheduleParser.findUpcomingShutdowns(schedule, now);
-
-                if (!upcoming.isEmpty()) {
-                    for (TimeInterval upcomingInterval : upcoming) {
-                        // 3. Find users who are subscribed AND *have not* been warned for this specific time
-                        String startTime = upcomingInterval.startTime(); // e.g., "15:00"
-                        List<Long> usersToWarn = dbService.getUsersToWarn(addressKey, startTime);
-
-                        if (!usersToWarn.isEmpty()) {
-                            System.out.println("[PRE-WARN CHECK] Found upcoming shutdown for " + addressKey + " at " + startTime + ". Warning " + usersToWarn.size() + " users.");
-
-                            // 4. Send warnings
-                            String message = "💡 *Попередження про відключення!*\n\n" +
-                                    "За вашою адресою **" + addresses.get(addressKey).name() + "**\n" +
-                                    "очікується відключення:\n\n" +
-                                    "➡️ " + upcomingInterval; // Uses TimeInterval.toString()
-
-                            for (Long chatId : usersToWarn) {
-                                bot.sendMessage(chatId, message);
-                            }
-
-                            // 5. Mark these users as warned *for this specific time*
-                            dbService.markUsersAsWarned(usersToWarn, addressKey, startTime);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                System.err.println("[PRE-WARN CHECK] Failed to check address " + addressKey + ": " + e.getMessage());
-                e.printStackTrace();
-            }
-        }
-    }
-
-    /**
-     * Formats and sends a "changes detected" message to all subscribers of an address.
-     */
-    private void notifyUsersOfChange(String addressKey, List<TimeInterval> newSchedule) {
-        String addressName = addresses.get(addressKey).name();
-        String message;
+        // Build the message
+        StringBuilder msgBuilder = new StringBuilder();
+        msgBuilder.append("✅ *Оновлення графіку!*\n\n");
+        msgBuilder.append("За адресою *").append(addressName).append("*");
 
         if (newSchedule.isEmpty()) {
-            message = "✅ *Оновлення графіку!*\n\n" +
-                    "За адресою **" + addressName + "** відключень на сьогодні більше *немає*." +
-                    "\n\n_(Минулий графік був іншим)._";
+            msgBuilder.append(" відключень на сьогодні більше немає.\n\n");
         } else {
-            message = "❗️ *Оновлення графіку!*\n\n" +
-                    "За адресою **" + addressName + "** діє **новий** графік відключень:\n\n" +
-                    newSchedule.stream()
-                            .map(TimeInterval::toString)
-                            .collect(Collectors.joining("\n"));
+            msgBuilder.append(" новий графік відключень:\n");
+            for (TimeInterval interval : newSchedule) {
+                msgBuilder.append("•  `").append(interval.startTime()).append(" - ").append(interval.endTime()).append("`\n");
+            }
+            msgBuilder.append("\n");
         }
 
-        List<Long> subscribers = dbService.getUsersForAddress(addressKey);
-        System.out.println("[NOTIFY] Sending change notification to " + subscribers.size() + " users for " + addressKey);
-        for (Long chatId : subscribers) {
+        // Add previous schedule for context, if it existed
+        if (!oldSchedule.isEmpty()) {
+            msgBuilder.append("_(Минулий графік був іншим)._");
+        }
+
+        String message = msgBuilder.toString();
+        for (Long chatId : userIds) {
             bot.sendMessage(chatId, message);
         }
-
-        // Clear all "warned" flags for this address, as the schedule has changed
-        dbService.clearWarnedFlags(addressKey);
     }
 
     /**
-     * Formats and sends a "no changes" message to all subscribers of an address.
+     * Task 2: Runs every 10 minutes to check for upcoming shutdowns.
      */
-    private void notifyUsersOfNoChange(String addressKey) {
-        String addressName = addresses.get(addressKey).name();
-        String message = "ℹ️ *Перевірка графіку*\n\n" +
-                "За адресою **" + addressName + "** змін у графіку відключень *немає*.\n\n" +
-                "Все стабільно.";
+    private void runPreShutdownWarningCheck() {
+        String now = LocalTime.now().format(TIME_FORMATTER);
+        System.out.println("\n[PRE-WARN CHECK] Running pre-shutdown warning check at " + now);
 
-        List<Long> subscribers = dbService.getUsersForAddress(addressKey);
-        System.out.println("[NOTIFY] Sending 'no change' notification to " + subscribers.size() + " users for " + addressKey);
-        for (Long chatId : subscribers) {
-            bot.sendMessage(chatId, message);
+        for (String addressKey : monitoredAddresses.keySet()) {
+            // 1. Get the current schedule from our DB
+            String scheduleJson = dbService.getSchedule(addressKey);
+            if (scheduleJson == null) continue; // No schedule cached for this address
+
+            List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
+            if (schedule.isEmpty()) continue; // No shutdowns planned
+
+            // 2. Find shutdowns starting in the next 30-40 mins
+            // (FIX) Call with one argument
+            List<TimeInterval> upcomingShutdowns = scheduleParser.findUpcomingShutdowns(schedule);
+            if (upcomingShutdowns.isEmpty()) continue;
+
+            // --- FIX ---
+            // Changed 'appConfig.getAddresses()' to the correct local field 'monitoredAddresses'
+            String addressName = monitoredAddresses.get(addressKey).name();
+            // --- END FIX ---
+
+            for (TimeInterval interval : upcomingShutdowns) {
+                String startTime = interval.startTime();
+                System.out.println("[PRE-WARN] Found upcoming shutdown for " + addressKey + " at " + startTime);
+
+                // 3. Find users who are subscribed AND haven't been warned yet
+                List<Long> usersToWarn = dbService.getUsersToWarn(addressKey, startTime);
+                if (usersToWarn.isEmpty()) continue; // Everyone already warned
+
+                System.out.println("[NOTIFY] Sending pre-warn notification to " + usersToWarn.size() + " users for " + addressKey);
+
+                // 4. Send the warning
+                String message = "❗️ *Увага! Попередження!*\n\n" +
+                        "За вашою адресою (*" + addressName + "*)\n" +
+                        "планується відключення о `" + startTime + "`.";
+
+                for (Long chatId : usersToWarn) {
+                    bot.sendMessage(chatId, message);
+                }
+
+                // 5. Mark these users as "warned" to prevent spam
+                dbService.markUsersAsWarned(usersToWarn, addressKey, startTime);
+            }
         }
     }
 }

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = 'ua.com.dtek.scraper'
-version = '4.0.1' // TelegramService Integration
+version = '4.2.1'
 
 repositories {
     mavenCentral()
