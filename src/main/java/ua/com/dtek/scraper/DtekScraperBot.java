@@ -24,9 +24,9 @@ import ua.com.dtek.scraper.service.DatabaseService;
 import ua.com.dtek.scraper.service.DtekScraperService;
 import ua.com.dtek.scraper.service.NotificationService;
 
+import java.lang.reflect.Type;
 import java.time.Duration;
 import java.time.Instant;
-import java.lang.reflect.Type;
 import java.util.List;
 import java.util.Map;
 
@@ -34,7 +34,7 @@ import java.util.Map;
  * Main entry point and the Telegram Bot class.
  *
  * @author Serhii Herasymenko
- * @version 5.0.0 (Fixes memory leak)
+ * @version 5.1.0
  */
 public class DtekScraperBot extends TelegramLongPollingBot {
 
@@ -59,7 +59,8 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
     public static void main(String[] args) {
         Instant start = Instant.now();
-        System.out.println("Starting DTEK Scraper Bot Service (v5.0.0)...");
+        // Оновлено вивід версії
+        System.out.println("Starting DTEK Scraper Bot Service (v5.0.2)...");
 
         try {
             // 1. Load application configuration
@@ -105,12 +106,6 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             e.printStackTrace();
             System.exit(1); // Exit if startup fails
         }
-        // --- MEMORY LEAK FIX (v4.3.0) ---
-        // We DO NOT call closeWebDriver() here anymore.
-        // The bot is a long-running service.
-        // NotificationService is now responsible for closing the browser
-        // after its scheduled tasks.
-        // --- END FIX ---
     }
 
     @Override
@@ -121,8 +116,8 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             } else if (update.hasCallbackQuery()) {
                 handleCallbackQuery(update.getCallbackQuery());
             }
-        } catch (TelegramApiException e) {
-            System.err.println("Error processing update: " + e.getMessage());
+        } catch (Exception e) { // Catch all exceptions
+            System.err.println("[Handler ERROR] Error processing update: " + e.getMessage());
             e.printStackTrace();
         }
     }
@@ -163,7 +158,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
     /**
      * Handles button clicks (CallbackQuery).
      *
-     * v4.2.3 Update: Fixes all compilation errors.
+     * v5.0.1 Update: ALWAYS triggers an async check on subscribe.
      */
     private void handleCallbackQuery(CallbackQuery callbackQuery) throws TelegramApiException {
         long chatId = callbackQuery.getMessage().getChatId();
@@ -189,12 +184,8 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         // 3. Save the user's choice to the database
         dbService.setUserAddress(chatId, addressKey);
         dbService.updateUserName(chatId, user.getFirstName());
-        // (v4.2.1 bug fix: we no longer log "subscribed" here, removed duplicate log)
 
-        // 4. Get the *current* cached schedule from the DB
-        String scheduleJson = dbService.getSchedule(addressKey);
-
-        // 5. Build the confirmation message
+        // 4. Build the confirmation message
         EditMessageText editedMessage = new EditMessageText();
         editedMessage.setChatId(Long.toString(chatId)); // Use Long.toString
         editedMessage.setMessageId((int) messageId); // Cast long to int
@@ -205,25 +196,22 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         textBuilder.append(selectedAddress.name()).append("\n\n");
         textBuilder.append("💡 *Поточний графік:*\n");
 
-        if (scheduleJson == null) {
-            // Case 1: (v4.2.2 fix) Schedule is NULL (unknown)
-            textBuilder.append("Обробка запиту... Графік для цієї адреси завантажується.\n\n");
-            textBuilder.append("Ви отримаєте сповіщення, щойно він з'явиться (зазвичай протягом 30 хв).");
-        } else {
-            List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
-            if (schedule.isEmpty()) {
-                // Case 2: Schedule is "[]" (empty list)
-                textBuilder.append("Відключень на сьогодні не заплановано.");
-            } else {
-                // Case 3: Schedule has intervals
-                for (TimeInterval interval : schedule) {
-                    textBuilder.append("•  `").append(interval.startTime()).append(" - ").append(interval.endTime()).append("`\n");
-                }
-            }
-        }
+        // --- (FIX v5.0.1) ---
+        // We ALWAYS show the "Loading..." message now,
+        // because we are ALWAYS triggering a fresh check.
+        textBuilder.append("Обробка запиту... Завантажую актуальний графік для вашої адреси.\n\n");
+        textBuilder.append("Ви отримаєте сповіщення, щойно він буде готовий (зазвичай ~1-2 хв).");
+        // --- END FIX ---
 
         editedMessage.setText(textBuilder.toString());
         execute(editedMessage);
+
+        // --- (FIX v5.0.1) ---
+        // We run this *after* sending the "please wait" message.
+        // We ALWAYS trigger a check for a new subscriber.
+        System.out.println("Triggering async check for " + addressKey + " for user " + chatId);
+        notificationService.forceCheckAddress(addressKey, chatId);
+        // --- END FIX ---
     }
 
     /**
