@@ -33,8 +33,8 @@ import java.util.Map;
 /**
  * Main entry point and the Telegram Bot class.
  *
- * @author Serhii Herasymenko (Updated by Senior Dev)
- * @version 4.3.0 (Fixes memory leak)
+ * @author Serhii Herasymenko
+ * @version 5.0.0 (Fixes memory leak)
  */
 public class DtekScraperBot extends TelegramLongPollingBot {
 
@@ -59,7 +59,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
     public static void main(String[] args) {
         Instant start = Instant.now();
-        System.out.println("Starting DTEK Scraper Bot Service (v4.3.0)...");
+        System.out.println("Starting DTEK Scraper Bot Service (v5.0.0)...");
 
         try {
             // 1. Load application configuration

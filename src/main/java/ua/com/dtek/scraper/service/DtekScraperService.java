@@ -1,19 +1,16 @@
 package ua.com.dtek.scraper.service;
 
+import ua.com.dtek.scraper.dto.Address;
 import ua.com.dtek.scraper.dto.TimeInterval;
 import ua.com.dtek.scraper.page.SchedulePage;
 import ua.com.dtek.scraper.parser.ScheduleParser;
-
 import java.util.List;
 
 /**
- * Orchestrates the scraping process.
- * <p>
- * This service class coordinates the actions of the Page Object (SchedulePage)
- * and the parser (ScheduleParser) to execute the full business logic.
- * <p>
- * v4.0.0 Update: This service is now stateless. It no longer depends on AppConfig
- * and instead receives address parameters for its methods.
+ * Оркеструє процес скрейпінгу.
+ * Координує дії Page Object (SchedulePage) та парсера (ScheduleParser).
+ *
+ * @version 4.4.3 (Fix silent failure on scrape error)
  */
 public class DtekScraperService {
 
@@ -21,55 +18,52 @@ public class DtekScraperService {
     private final ScheduleParser scheduleParser;
 
     /**
-     * Constructs the service, initializing its dependencies.
-     * We use Dependency Injection for the parser.
-     *
-     * @param parser The pre-initialized schedule parser.
+     * Конструктор сервісу.
+     * @param parser Ініціалізований ScheduleParser.
      */
     public DtekScraperService(ScheduleParser parser) {
-        this.schedulePage = new SchedulePage(); // POM is internal to the service
-        this.scheduleParser = parser;         // Parser is injected
+        this.schedulePage = new SchedulePage();
+        this.scheduleParser = parser;
     }
 
     /**
-     * Executes the main scraping flow for a specific address.
-     * <p>
-     * NOTE: This method is synchronized to prevent multiple threads (from the
-     * notification service) from using the single Selenide browser instance
-     * at the same time.
+     * Виконує повний цикл скрейпінгу для однієї адреси.
      *
-     * @param city     The city to check.
-     * @param street   The street to check.
-     * @param houseNum The house number to check.
-     * @return A list of TimeInterval objects describing the shutdown schedule.
+     * @return Список TimeIntervals.
+     * @throws RuntimeException якщо скрейпінг або парсинг не вдався.
      */
-    public synchronized List<TimeInterval> getShutdownSchedule(String city, String street, String houseNum) {
-        System.out.println("\n--- Starting new scrape task for: " + city + ", " + street + ", " + houseNum + " ---");
+    public List<TimeInterval> getShutdownSchedule(String city, String street, String houseNum) {
+        System.out.println("--- Starting new scrape task for: " + city + ", " + street + ", " + houseNum + " ---");
         try {
-            // 1. Open the page
+            // 1. Відкрити сторінку
             schedulePage.openPage();
 
-            // 2. Close popup
+            // 2. Закрити pop-up (якщо є)
             schedulePage.closeModalPopupIfPresent();
 
-            // 3. Fill the form using provided data
+            // 3. Заповнити форму
             schedulePage.fillAddressForm(city, street, houseNum);
 
-            // 4. Get the group name (and log it)
+            // 4. Отримати назву групи (для логування)
             String groupName = schedulePage.getGroupName();
             System.out.println("Found group in #group-name: " + groupName);
 
-            // 5. Get the table HTML from the page
+            // 5. Отримати HTML таблиці
             String tableHtml = schedulePage.getActiveScheduleTableHtml();
 
-            // 6. Pass the HTML to the parser and return the result
+            // 6. Розпарсити HTML та повернути результат
             return scheduleParser.parse(tableHtml);
 
         } catch (Exception e) {
-            System.err.println("[SCRAPER ERROR] Failed to get schedule for " + city + ", " + street + ": " + e.getMessage());
-            // It's important to return an empty list, not null,
-            // so the notification service can compare it.
-            return List.of();
+            // --- (FIX v4.4.3) ---
+            // "Тиха відмова" - це погано.
+            // Замість повернення Collections.emptyList(), ми "кидаємо" виняток.
+            // NotificationService перехопить це і НЕ буде оновлювати кеш
+            // або надсилати хибне сповіщення "No changes".
+            String errorMessage = "[SCRAPER ERROR] Failed to get schedule for " + city + ", " + street + ": " + e.getMessage();
+            System.err.println(errorMessage);
+            throw new RuntimeException(errorMessage, e);
+            // --- END FIX ---
         }
     }
 }

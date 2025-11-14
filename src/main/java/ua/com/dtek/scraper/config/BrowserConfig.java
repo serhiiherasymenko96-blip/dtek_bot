@@ -1,49 +1,52 @@
 package ua.com.dtek.scraper.config;
 
 import com.codeborne.selenide.Configuration;
+// --- (FIX v4.4.5) ---
+// Імпортуємо 'FirefoxOptions' для надійного налаштування
+import org.openqa.selenium.firefox.FirefoxOptions;
+// --- END FIX ---
+
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Handles the global configuration for the Selenide browser instance.
- * This is a utility class and is not meant to be instantiated.
+ *
+ *
+ * @version 4.4.5 (Final Fix: Using FirefoxOptions object)
  */
 public final class BrowserConfig {
 
     public static final String DTEK_URL = "https://www.dtek-dnem.com.ua/ua/shutdowns";
 
     /**
-     * Private constructor to prevent instantiation.
+     *
      */
     private BrowserConfig() {
         // Utility class
     }
 
     /**
-     * Initializes and applies all global Selenide configuration settings.
+     *
      */
     public static void setupSelenide() {
-        Configuration.browser = "chrome";
+        Configuration.browser = "firefox";
         Configuration.browserSize = "1920x1080";
-        // CRITICAL for server deployment:
         Configuration.headless = true;
-        Configuration.timeout = 20000; // Increased timeout for server
-        Configuration.pageLoadTimeout = 40000; // Increased timeout for server
+        Configuration.timeout = 10000; // 10 секунд
+        Configuration.pageLoadTimeout = 30000; // 30 секунд
 
-        // Set capabilities for robust server (Linux) execution
-        Configuration.browserCapabilities.setCapability("goog:chromeOptions",
-                java.util.Map.of("args", List.of(
-                        // --- SERVER FIX (v4.0.2) ---
-                        // Disables the sandbox, critical for running in containers or minimal VMs
-                        "--no-sandbox",
-                        // Disables the /dev/shm usage, another common issue in containers
-                        "--disable-dev-shm-usage",
-                        // --- END FIX ---
+        // --- (FIX v4.4.5) ---
 
-                        "--disable-gpu",
-                        "--disable-extensions", // Disable extensions
-                        "--window-size=1920,1080",
-                        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"
-                ))
-        );
+        String userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0";
+
+        FirefoxOptions options = new FirefoxOptions();
+        options.addArguments("-headless", "-width=1920", "-height=1080");
+        options.addPreference("general.useragent.override", userAgent);
+        options.setCapability("se:bidiEnabled", false);
+
+        Configuration.browserCapabilities = options;
+        // --- END FIX ---
     }
 }
