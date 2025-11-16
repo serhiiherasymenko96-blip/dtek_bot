@@ -2,6 +2,7 @@ package ua.com.dtek.scraper.service;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import ua.com.dtek.scraper.DtekScraperBot;
 import ua.com.dtek.scraper.dto.Address;
 import ua.com.dtek.scraper.dto.TimeInterval;
@@ -19,12 +20,13 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+// Імпортуємо closeWebDriver для виправлення витоку ресурсів
 import static com.codeborne.selenide.Selenide.closeWebDriver;
 
 /**
  * Handles all background monitoring tasks.
  *
- * @version 5.1.0 (Fixes concurrency crash on e2-micro)
+ * @version 5.2.0 (Fixes concurrency crash on e2-micro)
  */
 public class NotificationService {
 
@@ -37,10 +39,10 @@ public class NotificationService {
     private final Gson gson = new Gson();
     private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
 
-    // --- (FIX v5.1.0) ---
-    // Use a SINGLE-THREAD scheduler for ALL tasks (hourly, pre-warn, force-check)
-    // This serializes all scraping tasks and prevents multiple Firefox instances
-    // from running at the same time and crashing the e2-micro server.
+    // --- (FIX v5.2.0) ---
+    // Використовуємо ОДНОПОТОКОВИЙ планувальник для ВСІХ завдань (фонових, попереджень, форсованих)
+    // Це серіалізує всі завдання скрейпінгу і запобігає одночасному запуску
+    // кількох екземплярів Firefox, що "вбивало" сервер e2-micro.
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     // --- END FIX ---
 
@@ -63,29 +65,30 @@ public class NotificationService {
     public void startMonitoring() {
         System.out.println("Starting background monitoring tasks...");
 
-        // Task 1: Check for schedule changes (every 30 minutes)
+        // Завдання 1: Перевірка змін у графіку (кожні 30 хвилин)
         scheduler.scheduleAtFixedRate(this::runFullScheduleCheck, 2, 30, TimeUnit.MINUTES);
 
-        // Task 2: Check for pre-shutdown warnings (every 10 minutes)
+        // Завдання 2: Перевірка попереджень про відключення (кожні 10 хвилин)
         scheduler.scheduleAtFixedRate(this::runPreShutdownWarningCheck, 1, 10, TimeUnit.MINUTES);
     }
 
     /**
-     * (v5.0.0) Public method to queue a check for a single address,
-     * typically triggered by a new user subscription.
+     * (v5.0.0) Публічний метод для постановки в чергу перевірки однієї адреси,
+     * зазвичай викликається при підписці нового користувача.
      *
-     * @param addressKey   The address to check.
-     * @param notifyChatId The user who triggered this check and needs to be notified.
+     * @param addressKey   Адреса для перевірки.
+     * @param notifyChatId Користувач, який ініціював перевірку і якого треба сповістити.
      */
     public void forceCheckAddress(String addressKey, long notifyChatId) {
         System.out.println("Triggering async check for " + addressKey + " for user " + notifyChatId);
 
         // --- (FIX v5.1.0) ---
-        // Submit the task to the SAME single-thread scheduler.
-        // It will run as soon as the current task (if any) is finished.
+        // Відправляємо завдання у той самий ОДНОПОТОКОВИЙ планувальник.
+        // Воно виконається, щойно поточне завдання (якщо воно є) завершиться.
         scheduler.submit(() -> {
             Address address = monitoredAddresses.get(addressKey);
             if (address != null) {
+                // Запускаємо перевірку, передаючи ID користувача, якого треба сповістити
                 runCheckForSingleAddress(addressKey, address, notifyChatId);
             }
         });
@@ -93,65 +96,66 @@ public class NotificationService {
     }
 
     /**
-     * Task 1: Runs every 30 minutes to check ALL monitored addresses.
+     * Завдання 1: Виконується кожні 30 хвилин для перевірки ВСІХ відстежуваних адрес.
      */
     private void runFullScheduleCheck() {
         System.out.println("\n[SCHEDULE CHECK] Running full schedule change check...");
 
+        // (v4.3.0) Обгортаємо весь цикл перевірок у try/finally
         try {
             for (Map.Entry<String, Address> entry : monitoredAddresses.entrySet()) {
-                // Run the check, notifying NO specific user (notifyChatId = 0)
+                // Запускаємо перевірку, не сповіщуючи нікого конкретно (notifyChatId = 0)
                 runCheckForSingleAddress(entry.getKey(), entry.getValue(), 0);
             }
         } finally {
-            // --- MEMORY LEAK FIX (v4.3.0) ---
+            // (v4.3.0) Гарантовано закриваємо браузер ПІСЛЯ
+            // перевірки ВСІХ адрес, щоб звільнити ресурси.
             closeWebDriver();
             System.out.println("[SCHEDULE CHECK] Browser closed. Resources freed.");
-            // --- END FIX ---
         }
     }
 
     /**
-     * This is the core scraping logic, now centralized.
-     * It checks one address, compares it to the cache, and notifies relevant users.
+     * Це ядро логіки скрейпінгу, тепер централізоване.
+     * Перевіряє одну адресу, порівнює з кешем та сповіщає користувачів.
      *
-     * @param addressKey   The ID of the address (e.g., "address.1")
-     * @param address      The Address DTO
-     * @param notifyChatId The single user to notify (or 0 if it's a general check)
+     * @param addressKey   ID адреси (напр., "address.1")
+     * @param address      DTO адреси
+     * @param notifyChatId Один користувач для сповіщення (0, якщо це загальна перевірка)
      */
     private void runCheckForSingleAddress(String addressKey, Address address, long notifyChatId) {
         System.out.println("[CHECK] Checking address: " + address.name());
         List<TimeInterval> newSchedule = null;
-        List<TimeInterval> oldSchedule = null; // (v5.0.2 fix)
+        List<TimeInterval> oldSchedule = null;
         boolean scrapeSuccess = false;
-        boolean hasChanged = false; // (v5.0.2 fix)
+        boolean hasChanged = false;
 
         try {
-            // 1. Get the new schedule from the website
+            // 1. Отримуємо новий графік з сайту
             newSchedule = scraperService.getShutdownSchedule(
                     address.city(), address.street(), address.houseNum()
             );
             scrapeSuccess = true;
 
-            // 2. Get the old schedule from our database
+            // 2. Отримуємо старий графік з БД
             String oldScheduleJson = dbService.getSchedule(addressKey);
             oldSchedule = (oldScheduleJson == null)
                     ? Collections.emptyList()
                     : gson.fromJson(oldScheduleJson, scheduleListType);
 
-            // 3. Compare
+            // 3. Порівнюємо
             hasChanged = !oldSchedule.equals(newSchedule);
 
             if (hasChanged) {
                 System.out.println("[CHECK] CHANGES DETECTED for " + address.name());
 
-                // 4. Save the new schedule
+                // 4. Зберігаємо новий графік
                 dbService.saveSchedule(addressKey, newSchedule);
 
-                // 5. Notify ALL subscribed users
+                // 5. Сповіщаємо ВСІХ підписаних користувачів
                 notifyUsersOfChange(addressKey, address.name(), newSchedule, oldSchedule);
 
-                // 6. Clear old warning flags
+                // 6. Очищуємо старі прапорці попереджень
                 dbService.clearWarnedFlags(addressKey);
 
             } else {
@@ -159,17 +163,17 @@ public class NotificationService {
             }
 
         } catch (RuntimeException e) {
-            // This catches the RuntimeException from ScheduleParser (v4.0.2)
-            // or Selenide errors
+            // (v4.4.3) Перехоплюємо помилки від скрейпера (напр., збій Firefox)
+            // АБО помилки парсера (v4.0.2)
             System.err.println("[CHECK] CRITICAL FAILURE for " + address.name() + ": " + e.getMessage());
-            // We DO NOT send a notification and DO NOT update the cache
+            // Ми НЕ сповіщуємо і НЕ оновлюємо кеш
         }
 
         // --- (FIX v5.0.2) ---
-        // If this was a "force check" (triggered by a user),
-        // AND the scrape was successful,
-        // AND this wasn't a "change" notification (which already sent a message),
-        // we must send the current schedule to the user who asked.
+        // Якщо це була "форсована" перевірка (notifyChatId != 0),
+        // І скрейпінг пройшов успішно (scrapeSuccess == true),
+        // І змін не було (hasChanged == false) (бо якби вони були, ми б вже надіслали сповіщення),
+        // ми маємо надіслати щойно завантажений графік користувачу, який чекає.
         if (notifyChatId != 0 && scrapeSuccess && !hasChanged) {
             System.out.println("[FORCE CHECK] Sending current (unchanged) schedule to user " + notifyChatId);
             String scheduleString = formatSchedule(newSchedule);
@@ -177,27 +181,27 @@ public class NotificationService {
             bot.sendMessage(notifyChatId, message);
         }
 
-        // --- (FIX v5.1.0) ---
-        // If this was a "force check", we must close the browser *now*
-        // because the full check (which also closes) might be 30 mins away.
+        // --- (FIX v5.2.0) ---
+        // Якщо це була "форсована" перевірка (notifyChatId != 0),
+        // ми повинні закрити браузер *зараз*,
+        // оскільки 30-хвилинна перевірка (яка теж закриває браузер) може бути ще не скоро.
         if (notifyChatId != 0) {
             closeWebDriver();
             System.out.println("[FORCE CHECK] Browser closed. Resources freed for user " + notifyChatId);
         }
-        // --- END FIX ---
     }
 
     /**
-     * Helper to format and send the "schedule changed" notification.
+     * Допоміжний метод для форматування та надсилання сповіщення про "зміну графіка".
      */
     private void notifyUsersOfChange(String addressKey, String addressName, List<TimeInterval> newSchedule, List<TimeInterval> oldSchedule) {
-        if (bot == null) return; // Bot not ready
+        if (bot == null) return; // Бот ще не готовий
 
         List<Long> userIds = dbService.getUsersForAddress(addressKey);
         System.out.println("[NOTIFY] Sending change notification to " + userIds.size() + " users for " + addressKey);
         if (userIds.isEmpty()) return;
 
-        // Build the message
+        // Створюємо повідомлення
         String scheduleString = formatSchedule(newSchedule);
         String message = "✅ *Оновлення графіку!*\n\n" +
                 "За адресою *" + addressName + "* " +
@@ -210,17 +214,17 @@ public class NotificationService {
     }
 
     /**
-     * Task 2: Runs every 10 minutes to check for upcoming shutdowns.
+     * Завдання 2: Виконується кожні 10 хвилин для перевірки майбутніх відключень.
      */
     private void runPreShutdownWarningCheck() {
-        String now = LocalTime.now().format(TIME_FORMATTER);
+        String now = LocalTime.now(java.time.ZoneId.of("Europe/Kyiv")).format(TIME_FORMATTER); // (v5.2.0 fix)
         System.out.println("\n[PRE-WARN CHECK] Running pre-shutdown warning check at " + now);
 
         List<String> addressesWithUpcomingShutdowns = new ArrayList<>();
 
         try {
-            // --- (FIX v4.3.0) ---
-            // We check the DB *first* to avoid opening the browser if not needed.
+            // (v4.3.0) Ми перевіряємо БД *спочатку*, щоб не відкривати браузер без потреби.
+            // Ця логіка не використовує Selenide, вона лише читає з dtek_bot.db
             for (String addressKey : monitoredAddresses.keySet()) {
                 String scheduleJson = dbService.getSchedule(addressKey);
                 if (scheduleJson == null) continue;
@@ -228,6 +232,7 @@ public class NotificationService {
                 List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
                 if (schedule.isEmpty()) continue;
 
+                // (v4.2.2 fix)
                 List<TimeInterval> upcoming = scheduleParser.findUpcomingShutdowns(schedule);
                 if (!upcoming.isEmpty()) {
                     addressesWithUpcomingShutdowns.add(addressKey);
@@ -236,15 +241,15 @@ public class NotificationService {
 
             if (addressesWithUpcomingShutdowns.isEmpty()) {
                 System.out.println("[PRE-WARN CHECK] No upcoming shutdowns found for any address. Skipping.");
-                return; // No browser opened, no resources used.
+                return; // Браузер не відкрито, ресурси зекономлено.
             }
-            // --- END FIX ---
 
             System.out.println("[PRE-WARN] Found upcoming shutdowns across " + addressesWithUpcomingShutdowns.size() + " addresses.");
 
+            // Тепер ми надсилаємо сповіщення
             for (String addressKey : addressesWithUpcomingShutdowns) {
                 String scheduleJson = dbService.getSchedule(addressKey);
-                if (scheduleJson == null) { continue; } // Should be impossible due to check above, but safe
+                if (scheduleJson == null) { continue; }
 
                 List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
                 if (schedule.isEmpty()) { continue; }
@@ -258,14 +263,16 @@ public class NotificationService {
                     String startTime = interval.startTime();
                     System.out.println("[PRE-WARN] Found upcoming shutdown for " + addressKey + " at " + startTime);
 
+                    // Знаходимо користувачів, які підписані І яких ще НЕ попереджали
                     List<Long> usersToWarn = dbService.getUsersToWarn(addressKey, startTime);
                     if (usersToWarn.isEmpty()) {
                         System.out.println("[PRE-WARN] All users already warned for this interval.");
-                        continue; // Everyone already warned
+                        continue;
                     }
 
                     System.out.println("[NOTIFY] Sending pre-warn notification to " + usersToWarn.size() + " users for " + addressKey);
 
+                    // Надсилаємо попередження
                     String message = "❗️ *Увага! Попередження!*\n\n" +
                             "За вашою адресою (*" + addressName + "*)\n" +
                             "планується відключення о `" + startTime + "`.";
@@ -274,21 +281,20 @@ public class NotificationService {
                         bot.sendMessage(chatId, message);
                     }
 
+                    // Позначаємо, що ми їх попередили (щоб не спамити кожні 10 хв)
                     dbService.markUsersAsWarned(usersToWarn, addressKey, startTime);
                 }
             }
         } catch (Exception e) {
             System.err.println("[PRE-WARN CHECK] CRITICAL FAILURE: " + e.getMessage());
             e.printStackTrace();
-        } finally {
-            // --- (FIX v5.1.0) ---
-            // No browser is opened in this check (we trust the cache),
-            // so no closeWebDriver() is needed here.
         }
+        // (v5.1.0) Тут НЕМАЄ 'finally { closeWebDriver() }',
+        // оскільки ця перевірка працює лише з БД і не запускає браузер.
     }
 
     /**
-     * Helper method to format a list of intervals into a clean string.
+     * Допоміжний метод для форматування списку інтервалів у чистий рядок.
      */
     private String formatSchedule(List<TimeInterval> schedule) {
         if (schedule == null || schedule.isEmpty()) {
