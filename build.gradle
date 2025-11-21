@@ -5,7 +5,7 @@ plugins {
 }
 
 group = 'ua.com.dtek.scraper'
-version = '5.2.0'
+version = '7.0.0'
 
 repositories {
     mavenCentral()

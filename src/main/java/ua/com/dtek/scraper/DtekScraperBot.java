@@ -31,10 +31,10 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Main entry point and the Telegram Bot class.
+ * Головний клас та сам Telegram-бот.
  *
  * @author Serhii Herasymenko
- * @version 5.1.0
+ * @version 7.0.0 (Сумісність з групами та GroupSchedule)
  */
 public class DtekScraperBot extends TelegramLongPollingBot {
 
@@ -59,27 +59,26 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
     public static void main(String[] args) {
         Instant start = Instant.now();
-        // Оновлено вивід версії
-        System.out.println("Starting DTEK Scraper Bot Service (v5.0.2)...");
+        System.out.println("Starting DTEK Scraper Bot Service (v7.0.0)...");
 
         try {
-            // 1. Load application configuration
+            // 1. Завантажити конфігурацію
             AppConfig config = new AppConfig();
             config.loadConfig();
 
-            // 2. Configure the browser (Selenide)
+            // 2. Налаштувати браузер
             BrowserConfig.setupSelenide();
 
-            // 3. Initialize Database Service
+            // 3. Ініціалізувати Сервіс БД
             DatabaseService dbService = new DatabaseService(
                     config.getDatabasePath(),
                     config.getAddresses()
             );
 
-            // 4. Initialize Database
+            // 4. Ініціалізувати саму БД (створити таблиці)
             dbService.initDatabase();
 
-            // 5. Initialize other services
+            // 5. Ініціалізувати інші сервіси
             ScheduleParser parser = new ScheduleParser();
             DtekScraperService scraperService = new DtekScraperService(parser);
             NotificationService notificationService = new NotificationService(
@@ -89,12 +88,12 @@ public class DtekScraperBot extends TelegramLongPollingBot {
                     config.getAddresses()
             );
 
-            // 6. Register and start the bot
+            // 6. Зареєструвати та запустити бота
             TelegramBotsApi botsApi = new TelegramBotsApi(DefaultBotSession.class);
             DtekScraperBot bot = new DtekScraperBot(config, dbService, notificationService);
             botsApi.registerBot(bot);
 
-            // 7. Start background monitoring tasks
+            // 7. Запустити фонові завдання
             notificationService.startMonitoring();
 
             System.out.println("Bot successfully started and monitoring tasks are scheduled.");
@@ -104,7 +103,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         } catch (Exception e) {
             System.err.println("\n[FATAL] A top-level critical error occurred during startup:");
             e.printStackTrace();
-            System.exit(1); // Exit if startup fails
+            System.exit(1);
         }
     }
 
@@ -116,7 +115,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             } else if (update.hasCallbackQuery()) {
                 handleCallbackQuery(update.getCallbackQuery());
             }
-        } catch (Exception e) { // Catch all exceptions
+        } catch (Exception e) {
             System.err.println("[Handler ERROR] Error processing update: " + e.getMessage());
             e.printStackTrace();
         }
@@ -134,7 +133,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
 
     private void sendWelcomeMessage(Long chatId) throws TelegramApiException {
         SendMessage message = new SendMessage();
-        message.setChatId(Long.toString(chatId)); // Use Long.toString for safety
+        message.setChatId(Long.toString(chatId));
         message.setText("👋 Вітаю!\n\nОберіть адресу, за якою ви хочете відслідковувати графіки відключень:");
         message.setReplyMarkup(buildAddressKeyboard());
         execute(message);
@@ -148,7 +147,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             keyboardBuilder.keyboardRow(List.of(
                     InlineKeyboardButton.builder()
                             .text(entry.getValue().name())
-                            .callbackData(entry.getKey()) // e.g., "address.1"
+                            .callbackData(entry.getKey())
                             .build()
             ));
         }
@@ -156,39 +155,51 @@ public class DtekScraperBot extends TelegramLongPollingBot {
     }
 
     /**
-     * Handles button clicks (CallbackQuery).
-     *
-     * v5.0.1 Update: ALWAYS triggers an async check on subscribe.
+     * Обробка натискання кнопки.
+     * (v7.0.0) Адаптовано під нову структуру GroupSchedule.
      */
     private void handleCallbackQuery(CallbackQuery callbackQuery) throws TelegramApiException {
         long chatId = callbackQuery.getMessage().getChatId();
-        long messageId = callbackQuery.getMessage().getMessageId(); // This is 'long'
-        String addressKey = callbackQuery.getData(); // e.g., "address.1"
+        long messageId = callbackQuery.getMessage().getMessageId();
+        String addressKey = callbackQuery.getData();
         String callbackQueryId = callbackQuery.getId();
         User user = callbackQuery.getFrom();
 
-        // 1. Immediately answer the callback query to stop the "loading" spinner
+        // 1. Негайно відповідаємо
         AnswerCallbackQuery answer = new AnswerCallbackQuery();
         answer.setCallbackQueryId(callbackQueryId);
         execute(answer);
 
         System.out.println("User " + chatId + " selected address key: " + addressKey);
 
-        // 2. Get the address details from the config
+        // 2. Отримуємо деталі адреси
         Address selectedAddress = appConfig.getAddresses().get(addressKey);
         if (selectedAddress == null) {
             System.err.println("Error: User " + chatId + " selected unknown address key: " + addressKey);
             return;
         }
 
-        // 3. Save the user's choice to the database
+        // 3. Зберігаємо підписку та ім'я
         dbService.setUserAddress(chatId, addressKey);
         dbService.updateUserName(chatId, user.getFirstName());
 
-        // 4. Build the confirmation message
+        // 4. Отримуємо графік (Логіка Груп v6/v7)
+        String groupName = dbService.getGroupForAddress(addressKey);
+        String scheduleJson = null;
+
+        if (groupName != null) {
+            // --- FIX: Працюємо з об'єктом GroupSchedule ---
+            DatabaseService.GroupSchedule groupSchedule = dbService.getScheduleForGroup(groupName);
+            if (groupSchedule != null) {
+                scheduleJson = groupSchedule.scheduleJson();
+            }
+            // --- END FIX ---
+        }
+
+        // 5. Готуємо відповідь
         EditMessageText editedMessage = new EditMessageText();
-        editedMessage.setChatId(Long.toString(chatId)); // Use Long.toString
-        editedMessage.setMessageId((int) messageId); // Cast long to int
+        editedMessage.setChatId(Long.toString(chatId));
+        editedMessage.setMessageId((int) messageId);
         editedMessage.setParseMode("Markdown");
 
         StringBuilder textBuilder = new StringBuilder();
@@ -196,39 +207,38 @@ public class DtekScraperBot extends TelegramLongPollingBot {
         textBuilder.append(selectedAddress.name()).append("\n\n");
         textBuilder.append("💡 *Поточний графік:*\n");
 
-        // --- (FIX v5.0.1) ---
-        // We ALWAYS show the "Loading..." message now,
-        // because we are ALWAYS triggering a fresh check.
-        textBuilder.append("Обробка запиту... Завантажую актуальний графік для вашої адреси.\n\n");
-        textBuilder.append("Ви отримаєте сповіщення, щойно він буде готовий (зазвичай ~1-2 хв).");
-        // --- END FIX ---
+        if (scheduleJson == null) {
+            // Case 1: Графік або група невідомі
+            textBuilder.append("⏳ Група невідома або графік завантажується...\n");
+            textBuilder.append("_Зачекайте 1-2 хв, я надішлю сповіщення._");
+
+            // Запускаємо примусову перевірку
+            System.out.println("Triggering async check for " + addressKey + " for user " + chatId);
+            notificationService.forceCheckAddress(addressKey, chatId);
+
+        } else {
+            List<TimeInterval> schedule = gson.fromJson(scheduleJson, scheduleListType);
+            if (schedule.isEmpty()) {
+                // Case 2: Графік порожній
+                textBuilder.append("Відключень на сьогодні не заплановано.");
+            } else {
+                // Case 3: Графік є
+                textBuilder.append("_(Група: ").append(groupName).append(")_\n");
+                for (TimeInterval interval : schedule) {
+                    textBuilder.append("•  `").append(interval.startTime()).append(" - ").append(interval.endTime()).append("`\n");
+                }
+            }
+        }
 
         editedMessage.setText(textBuilder.toString());
         execute(editedMessage);
-
-        // --- (FIX v5.0.1) ---
-        // We run this *after* sending the "please wait" message.
-        // We ALWAYS trigger a check for a new subscriber.
-        System.out.println("Triggering async check for " + addressKey + " for user " + chatId);
-        notificationService.forceCheckAddress(addressKey, chatId);
-        // --- END FIX ---
     }
 
-    /**
-     * Public method to send a message (used by NotificationService).
-     *
-     * @param chatId  The target chat ID.
-     * @param message The message text (Markdown supported).
-     */
     public void sendMessage(long chatId, String message) {
-        SendMessage sendMessage = new SendMessage();
-        sendMessage.setChatId(Long.toString(chatId)); // Use Long.toString
-        sendMessage.setText(message);
-        sendMessage.setParseMode("Markdown");
-        try {
-            execute(sendMessage);
-        } catch (TelegramApiException e) {
-            System.err.println("Failed to send message to " + chatId + ": " + e.getMessage());
-        }
+        SendMessage sm = new SendMessage();
+        sm.setChatId(Long.toString(chatId));
+        sm.setText(message);
+        sm.setParseMode("Markdown");
+        try { execute(sm); } catch (TelegramApiException e) { e.printStackTrace(); }
     }
 }
