@@ -19,8 +19,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-import static com.codeborne.selenide.Selenide.closeWebDriver;
-
 public class NotificationService {
 
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
@@ -48,7 +46,7 @@ public class NotificationService {
 
     public void startMonitoring() {
         System.out.println("Starting background monitoring tasks...");
-        scheduler.scheduleAtFixedRate(this::runFullScheduleCheck, 2, 30, TimeUnit.MINUTES);
+        scheduler.scheduleAtFixedRate(this::runFullScheduleCheck, 2, 45, TimeUnit.MINUTES);
         scheduler.scheduleAtFixedRate(this::runPreShutdownWarningCheck, 1, 10, TimeUnit.MINUTES);
     }
 
@@ -60,28 +58,68 @@ public class NotificationService {
         });
     }
 
+    /**
+     * ОПТИМІЗОВАНИЙ метод перевірки.
+     * 1. Ізоляція сесій (відкрив/закрив) для стабільності.
+     * 2. Кешування груп в межах циклу (не перевіряємо одну групу двічі в одному запуску).
+     */
     private void runFullScheduleCheck() {
         System.out.println("\n[SCHEDULE CHECK] Running full schedule change check...");
         List<AddressInfo> addressesToCheck = dbService.getAddressesForFullCheck(GROUP_CACHE_EXPIRATION_MINUTES, GROUP_REVERIFICATION_DAYS);
+
         if (addressesToCheck.isEmpty()) {
             System.out.println("[SCHEDULE CHECK] All group caches are fresh.");
             return;
         }
 
         System.out.println("[SCHEDULE CHECK] Checking " + addressesToCheck.size() + " addresses.");
-        try {
-            scraperService.openSession();
-            for (AddressInfo info : addressesToCheck) {
-                handleScrapeResult(info.addressKey(), info.address(), 0,
-                        scraperService.checkAddressInSession(
-                                info.address().city(), info.address().street(), info.address().houseNum()));
+
+        // Сет для зберігання груп, які ми ВЖЕ оновили в цьому циклі запуску.
+        Set<String> groupsUpdatedInCurrentCycle = new HashSet<>();
+
+        for (AddressInfo info : addressesToCheck) {
+            String addressName = info.address().name();
+            String knownGroup = info.groupName(); // Група, яку ми знаємо з попередніх перевірок
+
+            // --- ОПТИМІЗАЦІЯ ---
+            // Якщо ми знаємо групу цієї адреси, і ця група вже була оновлена
+            // під час перевірки іншої адреси в цьому ж циклі -> ПРОПУСКАЄМО браузер.
+            if (knownGroup != null && groupsUpdatedInCurrentCycle.contains(knownGroup)) {
+                System.out.println(">>> Optimization: Skipping browser for " + addressName + " (Group " + knownGroup + " already updated).");
+
+                // Важливо: Оновлюємо timestamp для цієї адреси, щоб вона не висіла як "застаріла"
+                dbService.updateAddressGroupAndTimestamp(info.addressKey(), knownGroup);
+                continue;
             }
-        } catch (Exception e) {
-            System.err.println("[SCHEDULE CHECK] CRITICAL SESSION FAILURE: " + e.getMessage());
-        } finally {
-            scraperService.closeSession();
-            System.out.println("[SCHEDULE CHECK] Browser closed.");
+            // -------------------
+
+            System.out.println(">>> Processing address: " + addressName);
+            try {
+                // Відкриваємо сесію (тут використовується наш CustomFirefoxProvider з BrowserConfig)
+                scraperService.openSession();
+
+                ScrapeResult result = scraperService.checkAddressInSession(
+                        info.address().city(), info.address().street(), info.address().houseNum());
+
+                handleScrapeResult(info.addressKey(), info.address(), 0, result);
+
+                // Додаємо оновлену групу в сет, щоб не перевіряти її знову для інших адрес
+                if (result.groupName() != null) {
+                    groupsUpdatedInCurrentCycle.add(result.groupName());
+                }
+
+            } catch (Exception e) {
+                System.err.println("[SCHEDULE CHECK] Failed to check " + addressName + ": " + e.getMessage());
+            } finally {
+                try {
+                    scraperService.closeSession();
+                    Thread.sleep(1000); // Даємо час ОС звільнити ресурси
+                } catch (Exception e) {
+                    System.err.println("Error closing session: " + e.getMessage());
+                }
+            }
         }
+        System.out.println("[SCHEDULE CHECK] Cycle complete.");
     }
 
     private void runCheckForSingleAddress_Isolated(String addressKey, Address address, long notifyChatId) {
@@ -92,7 +130,7 @@ public class NotificationService {
             handleScrapeResult(addressKey, address, notifyChatId, result);
         } catch (Exception e) {
             System.err.println("[FORCE CHECK] FAILURE: " + e.getMessage());
-            if (notifyChatId != 0) bot.sendMessage(notifyChatId, "❌ Помилка. Спробуйте пізніше.");
+            if (notifyChatId != 0) bot.sendMessage(notifyChatId, "❌ Помилка при отриманні даних (" + e.getMessage() + "). Спробуйте пізніше.");
         } finally {
             scraperService.closeSession();
             System.out.println("[FORCE CHECK] Browser closed.");
@@ -103,7 +141,9 @@ public class NotificationService {
         List<TimeInterval> newSchedule = result.schedule();
         String newGroupName = result.groupName();
 
+        // Оновлюємо прив'язку адреси до групи та час перевірки
         dbService.updateAddressGroupAndTimestamp(addressKey, newGroupName);
+
         DatabaseService.GroupSchedule oldGroupSched = dbService.getScheduleForGroup(newGroupName);
         List<TimeInterval> oldSchedule = (oldGroupSched == null || oldGroupSched.scheduleJson() == null)
                 ? Collections.emptyList() : gson.fromJson(oldGroupSched.scheduleJson(), scheduleListType);
@@ -112,13 +152,18 @@ public class NotificationService {
 
         if (hasChanged) {
             System.out.println("[CHECK] CHANGES DETECTED for group " + newGroupName);
+            // Зберігаємо новий графік групи
             dbService.saveScheduleForGroup(newGroupName, newSchedule);
+
+            // Сповіщаємо ВСІХ користувачів цієї групи.
             List<Long> users = dbService.getUsersForGroup(newGroupName);
-            if (notifyChatId != 0) users.remove(notifyChatId);
+            if (notifyChatId != 0) users.remove(notifyChatId); // Щоб не дублювати повідомлення ініціатору
             notifyUsers(users, newGroupName, newSchedule, true);
+
             dbService.clearWarnedFlagsForGroup(newGroupName);
         } else {
             System.out.println("[CHECK] No changes for group " + newGroupName);
+            // Оновлюємо timestamp групи ("last_checked"), щоб знати, що вона актуальна
             dbService.saveScheduleForGroup(newGroupName, newSchedule);
         }
 
@@ -139,7 +184,6 @@ public class NotificationService {
     private void runPreShutdownWarningCheck() {
         String now = LocalTime.now(TIME_ZONE).format(TIME_FORMATTER);
         System.out.println("\n[PRE-WARN CHECK] " + now);
-        // (Спрощена логіка: беремо всі адреси, перевіряємо групи і ворнінги)
         try {
             for (String key : monitoredAddresses.keySet()) {
                 String group = dbService.getGroupForAddress(key);
