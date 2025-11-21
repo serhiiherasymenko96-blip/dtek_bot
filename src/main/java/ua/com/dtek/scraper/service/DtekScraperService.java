@@ -1,69 +1,52 @@
 package ua.com.dtek.scraper.service;
 
-import ua.com.dtek.scraper.dto.Address;
+import ua.com.dtek.scraper.dto.ScrapeResult;
 import ua.com.dtek.scraper.dto.TimeInterval;
 import ua.com.dtek.scraper.page.SchedulePage;
 import ua.com.dtek.scraper.parser.ScheduleParser;
 import java.util.List;
 
-/**
- * Оркеструє процес скрейпінгу.
- * Координує дії Page Object (SchedulePage) та парсера (ScheduleParser).
- *
- * @version 4.4.3 (Fix silent failure on scrape error)
- */
+import static com.codeborne.selenide.Selenide.closeWebDriver;
+
 public class DtekScraperService {
 
     private final SchedulePage schedulePage;
     private final ScheduleParser scheduleParser;
 
-    /**
-     * Конструктор сервісу.
-     * @param parser Ініціалізований ScheduleParser.
-     */
     public DtekScraperService(ScheduleParser parser) {
         this.schedulePage = new SchedulePage();
         this.scheduleParser = parser;
     }
 
-    /**
-     * Виконує повний цикл скрейпінгу для однієї адреси.
-     *
-     * @return Список TimeIntervals.
-     * @throws RuntimeException якщо скрейпінг або парсинг не вдався.
-     */
-    public List<TimeInterval> getShutdownSchedule(String city, String street, String houseNum) {
-        System.out.println("--- Starting new scrape task for: " + city + ", " + street + ", " + houseNum + " ---");
+    public void openSession() {
+        System.out.println("--- Opening Browser Session ---");
         try {
-            // 1. Відкрити сторінку
             schedulePage.openPage();
-
-            // 2. Закрити pop-up (якщо є)
             schedulePage.closeModalPopupIfPresent();
+        } catch (Exception e) {
+            closeSession();
+            throw new RuntimeException("Failed to open browser: " + e.getMessage(), e);
+        }
+    }
 
-            // 3. Заповнити форму
+    public ScrapeResult checkAddressInSession(String city, String street, String houseNum) {
+        System.out.println("--- Checking address in session: " + city + ", " + street + " ---");
+        try {
             schedulePage.fillAddressForm(city, street, houseNum);
-
-            // 4. Отримати назву групи (для логування)
             String groupName = schedulePage.getGroupName();
             System.out.println("Found group in #group-name: " + groupName);
-
-            // 5. Отримати HTML таблиці
             String tableHtml = schedulePage.getActiveScheduleTableHtml();
-
-            // 6. Розпарсити HTML та повернути результат
-            return scheduleParser.parse(tableHtml);
-
+            List<TimeInterval> schedule = scheduleParser.parse(tableHtml);
+            return new ScrapeResult(groupName, schedule);
         } catch (Exception e) {
-            // --- (FIX v4.4.3) ---
-            // "Тиха відмова" - це погано.
-            // Замість повернення Collections.emptyList(), ми "кидаємо" виняток.
-            // NotificationService перехопить це і НЕ буде оновлювати кеш
-            // або надсилати хибне сповіщення "No changes".
-            String errorMessage = "[SCRAPER ERROR] Failed to get schedule for " + city + ", " + street + ": " + e.getMessage();
-            System.err.println(errorMessage);
-            throw new RuntimeException(errorMessage, e);
-            // --- END FIX ---
+            String msg = "[SCRAPER ERROR] Failed to check " + city + ", " + street + ": " + e.getMessage();
+            System.err.println(msg);
+            throw new RuntimeException(msg, e);
         }
+    }
+
+    public void closeSession() {
+        System.out.println("--- Closing Browser Session ---");
+        closeWebDriver();
     }
 }

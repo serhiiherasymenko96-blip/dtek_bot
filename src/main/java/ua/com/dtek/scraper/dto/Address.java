@@ -10,6 +10,7 @@ package ua.com.dtek.scraper.dto;
  * @param houseNum The house number for the form (e.g., "24/А")
  */
 public record Address(
+        String addressKey, // Унікальний ID (напр. "address.1")
         String name,
         String city,
         String street,
