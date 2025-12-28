@@ -57,6 +57,51 @@ public class DtekScraperService {
         }, 2, operationName, 2000);
     }
 
+    /**
+     * Checks the next day's schedule for an address in the current browser session.
+     * This method assumes that the browser session is already open.
+     * 
+     * @param city The city name
+     * @param street The street name
+     * @param houseNum The house number
+     * @return A ScrapeResult containing the group name and schedule
+     */
+    public ScrapeResult checkNextDayAddressInSession(String city, String street, String houseNum) {
+        System.out.println("--- Checking next day address in session: " + city + ", " + street + " ---");
+
+        String operationName = "next day address check for " + city + ", " + street;
+        return RetryUtil.withRetry(() -> {
+            // Step 1: Fill the address form
+            System.out.println("Step 1: Filling address form...");
+            schedulePage.fillAddressForm(city, street, houseNum);
+
+            // Step 2: Get the group name
+            System.out.println("Step 2: Getting group name...");
+            String groupName = schedulePage.getGroupName();
+            System.out.println("Found group in #group-name: " + groupName);
+
+            // Step 3: Select the next day's date if available
+            System.out.println("Step 3: Selecting next day's date...");
+            boolean dateSelected = schedulePage.selectNextDayDate();
+            if (!dateSelected) {
+                System.out.println("Next day date selection not available, using current date");
+            } else {
+                System.out.println("Next day date selected successfully");
+            }
+
+            // Step 4: Get the schedule table HTML
+            System.out.println("Step 4: Getting schedule table...");
+            String tableHtml = schedulePage.getActiveScheduleTableHtml();
+
+            // Step 5: Parse the schedule
+            System.out.println("Step 5: Parsing schedule...");
+            List<TimeInterval> schedule = scheduleParser.parse(tableHtml);
+
+            System.out.println("Successfully completed all steps for next day " + city + ", " + street);
+            return new ScrapeResult(groupName, schedule);
+        }, 2, operationName, 2000);
+    }
+
     public void closeSession() {
         System.out.println("--- Closing Browser Session ---");
         try {

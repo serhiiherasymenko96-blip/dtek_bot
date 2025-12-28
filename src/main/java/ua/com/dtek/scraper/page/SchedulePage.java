@@ -32,6 +32,11 @@ public class SchedulePage {
     private final SelenideElement groupNameSpan = $("#group-name span");
     private final SelenideElement activeTableContainer = $(".discon-fact-table.active");
 
+    // Date selectors
+    private final SelenideElement datesContainer = $("div.dates");
+    private final SelenideElement todayDateElement = $("div.dates div.date:first-child");
+    private final SelenideElement tomorrowDateElement = $("div.dates div.date:nth-child(2)");
+
     // --- Page Actions ---
 
     /**
@@ -140,5 +145,110 @@ public class SchedulePage {
     public String getActiveScheduleTableHtml() {
         System.out.println("\n--- Waiting for active schedule table ---");
         return activeTableContainer.shouldBe(visible).innerHtml();
+    }
+
+    /**
+     * Checks if date selection is available on the page.
+     *
+     * @return true if date selection is available, false otherwise
+     */
+    public boolean isDateSelectionAvailable() {
+        try {
+            return datesContainer.is(exist) && datesContainer.is(visible, Duration.ofSeconds(5));
+        } catch (Exception e) {
+            System.out.println("Date selection is not available: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Gets the currently active date (today or tomorrow).
+     *
+     * @return "today" if today's date is active, "tomorrow" if tomorrow's date is active, or null if date selection is not available
+     */
+    public String getActiveDate() {
+        if (!isDateSelectionAvailable()) return null;
+
+        try {
+            if (todayDateElement.has(cssClass("active"))) {
+                return "today";
+            } else if (tomorrowDateElement.has(cssClass("active"))) {
+                return "tomorrow";
+            }
+        } catch (Exception e) {
+            System.err.println("Error determining active date: " + e.getMessage());
+        }
+
+        return null;
+    }
+
+    /**
+     * Selects the next day's date if date selection is available.
+     *
+     * @return true if the next day's date was successfully selected, false otherwise
+     */
+    public boolean selectNextDayDate() {
+        if (!isDateSelectionAvailable()) {
+            System.out.println("Date selection is not available, cannot select next day");
+            return false;
+        }
+
+        try {
+            System.out.println("Selecting next day date...");
+            tomorrowDateElement.shouldBe(visible, Duration.ofSeconds(5));
+            tomorrowDateElement.shouldBe(enabled, Duration.ofSeconds(5));
+            tomorrowDateElement.click();
+
+            // Wait for the date to become active
+            tomorrowDateElement.shouldHave(cssClass("active"), Duration.ofSeconds(5));
+
+            // Wait for the schedule table to update
+            try {
+                Thread.sleep(2000); // Give the page time to update the schedule
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            System.out.println("Next day date selected successfully");
+            return true;
+        } catch (Exception e) {
+            System.err.println("Failed to select next day date: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Selects today's date if date selection is available.
+     *
+     * @return true if today's date was successfully selected, false otherwise
+     */
+    public boolean selectTodayDate() {
+        if (!isDateSelectionAvailable()) {
+            System.out.println("Date selection is not available, cannot select today");
+            return false;
+        }
+
+        try {
+            System.out.println("Selecting today's date...");
+            todayDateElement.shouldBe(visible, Duration.ofSeconds(5));
+            todayDateElement.shouldBe(enabled, Duration.ofSeconds(5));
+            todayDateElement.click();
+
+            // Wait for the date to become active
+            todayDateElement.shouldHave(cssClass("active"), Duration.ofSeconds(5));
+
+            // Wait for the schedule table to update
+            try {
+                Thread.sleep(2000); // Give the page time to update the schedule
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            System.out.println("Today's date selected successfully");
+            return true;
+        } catch (Exception e) {
+            System.err.println("Failed to select today's date: " + e.getMessage());
+            return false;
+        }
     }
 }

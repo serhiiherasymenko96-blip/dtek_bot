@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -45,12 +46,14 @@ public class DatabaseService {
         String sqlAddr = "CREATE TABLE IF NOT EXISTS addresses (address_key TEXT PRIMARY KEY, display_name TEXT NOT NULL, group_name TEXT, group_last_checked INTEGER NOT NULL DEFAULT 0);";
         String sqlGroups = "CREATE TABLE IF NOT EXISTS groups (group_name TEXT PRIMARY KEY, schedule_json TEXT, last_checked INTEGER NOT NULL DEFAULT 0);";
         String sqlWarn = "CREATE TABLE IF NOT EXISTS warned_users (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, address_key TEXT NOT NULL, outage_start_time TEXT NOT NULL, UNIQUE(chat_id, address_key, outage_start_time));";
+        String sqlNextDayGroups = "CREATE TABLE IF NOT EXISTS next_day_groups (group_name TEXT PRIMARY KEY, schedule_json TEXT, last_checked INTEGER NOT NULL DEFAULT 0);";
 
         try (Connection conn = DriverManager.getConnection(dbUrl); Statement stmt = conn.createStatement()) {
             stmt.execute(sqlUsers);
             stmt.execute(sqlAddr);
             stmt.execute(sqlGroups);
             stmt.execute(sqlWarn);
+            stmt.execute(sqlNextDayGroups);
 
             // Міграція
             try { stmt.execute("ALTER TABLE addresses ADD COLUMN group_name TEXT"); } catch (SQLException e) {}
@@ -132,6 +135,25 @@ public class DatabaseService {
         } catch (SQLException e) { e.printStackTrace(); }
     }
 
+    /**
+     * Saves a schedule for a group for the next day.
+     * 
+     * @param group The group name
+     * @param schedule The schedule to save
+     */
+    public void saveNextDayScheduleForGroup(String group, List<TimeInterval> schedule) {
+        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("INSERT OR REPLACE INTO next_day_groups (group_name, schedule_json, last_checked) VALUES (?, ?, ?)")) {
+            ps.setString(1, group);
+            ps.setString(2, gson.toJson(schedule));
+            ps.setLong(3, System.currentTimeMillis() / 1000L);
+            ps.executeUpdate();
+            System.out.println("Saved next day schedule for group: " + group);
+        } catch (SQLException e) { 
+            System.err.println("Error saving next day schedule for group: " + e.getMessage());
+            e.printStackTrace(); 
+        }
+    }
+
     public GroupSchedule getScheduleForGroup(String group) {
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement ps = conn.prepareStatement("SELECT schedule_json, last_checked FROM groups WHERE group_name = ?")) {
@@ -145,6 +167,75 @@ public class DatabaseService {
         }
         return null;
     }
+
+    /**
+     * Gets a schedule for a group for the next day.
+     * 
+     * @param group The group name
+     * @return The next day's schedule for the group, or null if not found
+     */
+    public GroupSchedule getNextDayScheduleForGroup(String group) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT schedule_json, last_checked FROM next_day_groups WHERE group_name = ?")) {
+            ps.setString(1, group);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return new GroupSchedule(rs.getString("schedule_json"), rs.getLong("last_checked"));
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting next day schedule for group: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    /**
+     * Copies all next day schedules to the main schedules.
+     * This should be called after midnight to make the next day's schedules the main ones.
+     */
+    public void copyNextDaySchedulesToMainSchedules() {
+        try (Connection conn = DriverManager.getConnection(dbUrl)) {
+            // First, get all next day schedules
+            List<String> groupsToUpdate = new ArrayList<>();
+            Map<String, String> scheduleJsonMap = new HashMap<>();
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT group_name, schedule_json FROM next_day_groups")) {
+                while (rs.next()) {
+                    String groupName = rs.getString("group_name");
+                    String scheduleJson = rs.getString("schedule_json");
+                    groupsToUpdate.add(groupName);
+                    scheduleJsonMap.put(groupName, scheduleJson);
+                }
+            }
+
+            if (groupsToUpdate.isEmpty()) {
+                System.out.println("No next day schedules to copy to main schedules.");
+                return;
+            }
+
+            // Then, update the main schedules
+            try (PreparedStatement ps = conn.prepareStatement("INSERT OR REPLACE INTO groups (group_name, schedule_json, last_checked) VALUES (?, ?, ?)")) {
+                for (String groupName : groupsToUpdate) {
+                    ps.setString(1, groupName);
+                    ps.setString(2, scheduleJsonMap.get(groupName));
+                    ps.setLong(3, System.currentTimeMillis() / 1000L);
+                    ps.addBatch();
+                }
+                int[] results = ps.executeBatch();
+                System.out.println("Copied " + results.length + " next day schedules to main schedules.");
+            }
+
+            // Finally, clear the next day schedules
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("DELETE FROM next_day_groups");
+                System.out.println("Cleared next day schedules table.");
+            }
+        } catch (SQLException e) {
+            System.err.println("Error copying next day schedules to main schedules: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
     public record GroupSchedule(String scheduleJson, long lastChecked) {}
 
     public List<Long> getUsersForGroup(String group) {
@@ -214,6 +305,28 @@ public class DatabaseService {
 
     public void updateUserName(long chatId, String name) {
         updateUserProperty(chatId, "first_name", name);
+    }
+
+    /**
+     * Gets the subscribed address key for a user.
+     * 
+     * @param chatId The chat ID of the user
+     * @return The subscribed address key, or null if the user is not subscribed to any address
+     */
+    public String getUserSubscribedAddress(long chatId) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT subscribed_address_key FROM users WHERE chat_id = ?")) {
+            ps.setLong(1, chatId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("subscribed_address_key");
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting user's subscribed address: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
     }
 
     public List<Long> getUsersToWarn(String key, String time) {

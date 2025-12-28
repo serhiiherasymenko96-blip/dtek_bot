@@ -206,11 +206,35 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             System.out.println("Received /check command from user: " + chatId);
             sendMessage(chatId, "🔍 Запускаю незаплановану перевірку графіків...");
             notificationService.forceCheckAllAddresses(chatId);
+        } else if ("/nextday".equals(text)) {
+            System.out.println("Received /nextday command from user: " + chatId);
+            handleNextDayCommand(chatId);
         } else if (text.startsWith("/broadcast")) {
             // Check if user is admin (you can add admin check here)
             System.out.println("Received /broadcast command from user: " + chatId);
             handleBroadcastCommand(chatId, text);
         }
+    }
+
+    /**
+     * Handle the nextday command to check the next day's schedule
+     * 
+     * @param chatId The chat ID of the user who sent the command
+     */
+    private void handleNextDayCommand(long chatId) {
+        // Get the user's subscribed address
+        String addressKey = dbService.getUserSubscribedAddress(chatId);
+
+        if (addressKey == null) {
+            sendMessage(chatId, "⚠️ Ви не підписані на жодну адресу. Використайте команду /start щоб обрати адресу.");
+            return;
+        }
+
+        // Send a message to the user
+        sendMessage(chatId, "🔍 Перевіряю графік на завтра...");
+
+        // Check the next day's schedule
+        notificationService.forceCheckNextDayAddress(addressKey, chatId);
     }
 
     /**

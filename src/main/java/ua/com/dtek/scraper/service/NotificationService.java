@@ -133,6 +133,208 @@ public class NotificationService {
         // Scheduled checks
         scheduler.scheduleAtFixedRate(() -> safeRun(this::runFullScheduleCheck), 2, 45, TimeUnit.MINUTES);
         scheduler.scheduleAtFixedRate(() -> safeRun(this::runPreShutdownWarningCheck), 1, 10, TimeUnit.MINUTES);
+
+        // Schedule next day checks (hourly after 20:00)
+        scheduler.scheduleAtFixedRate(() -> safeRun(this::checkAndRunNextDaySchedule), 1, 60, TimeUnit.MINUTES);
+
+        // Schedule midnight task to copy next day schedules to main schedules
+        scheduler.scheduleAtFixedRate(() -> safeRun(this::checkAndCopyNextDaySchedules), 1, 60, TimeUnit.MINUTES);
+    }
+
+    /**
+     * Checks if it's after 20:00 and before midnight, and if so, runs the next day schedule check.
+     */
+    private void checkAndRunNextDaySchedule() {
+        LocalTime now = LocalTime.now(TIME_ZONE);
+        if (now.isAfter(LocalTime.of(20, 0)) && now.isBefore(LocalTime.of(23, 59))) {
+            System.out.println("[NEXT DAY CHECK] It's after 20:00, checking next day schedule...");
+            runNextDayScheduleCheck();
+        } else {
+            System.out.println("[NEXT DAY CHECK] It's not after 20:00 yet, skipping next day schedule check.");
+        }
+    }
+
+    /**
+     * Checks the next day's schedule for all addresses and saves the results to the next_day_groups table.
+     * This method is similar to runFullScheduleCheck() but uses checkNextDayAddressInSession() and saves to next_day_groups.
+     */
+    private void runNextDayScheduleCheck() {
+        System.out.println("\n[NEXT DAY CHECK] Running next day schedule check...");
+        List<AddressInfo> addressesToCheck = dbService.getAddressesForFullCheck(GROUP_CACHE_EXPIRATION_MINUTES, GROUP_REVERIFICATION_DAYS);
+
+        if (addressesToCheck.isEmpty()) {
+            System.out.println("[NEXT DAY CHECK] No addresses to check.");
+            return;
+        }
+
+        System.out.println("[NEXT DAY CHECK] Checking " + addressesToCheck.size() + " addresses for next day schedule.");
+
+        // Set for storing groups that we have ALREADY updated in this run cycle
+        Set<String> groupsUpdatedInCurrentCycle = new HashSet<>();
+
+        // Tracking error count for addresses
+        Map<String, Integer> addressFailureCount = new ConcurrentHashMap<>();
+        final int MAX_FAILURES = 3;
+
+        // Use CountDownLatch to track completion of all tasks
+        CountDownLatch completionLatch = new CountDownLatch(addressesToCheck.size());
+
+        // Limit the number of concurrent checks
+        for (AddressInfo info : addressesToCheck) {
+            String addressName = info.address().name();
+            String knownGroup = info.groupName(); // Group that we know from previous checks
+
+            // --- OPTIMIZATION ---
+            // If we know the group of this address, and this group has already been updated
+            // during the check of another address in this cycle -> SKIP the browser.
+            if (knownGroup != null && groupsUpdatedInCurrentCycle.contains(knownGroup)) {
+                System.out.println(">>> Optimization: Skipping browser for next day check of " + addressName + " (Group " + knownGroup + " already updated).");
+                completionLatch.countDown();
+                continue;
+            }
+            // -------------------
+
+            // Submit the task to the checkExecutor instead of the scheduler
+            checkExecutor.submit(() -> {
+                try {
+                    // Wait for an available slot with timeout
+                    System.out.println(">>> Waiting for available check slot for next day check of " + addressName);
+                    boolean acquired = checkSemaphore.tryAcquire(5, TimeUnit.MINUTES);
+                    if (!acquired) {
+                        System.err.println(">>> Timed out waiting for semaphore for next day check of " + addressName);
+                        completionLatch.countDown();
+                        return;
+                    }
+
+                    try {
+                        System.out.println(">>> Processing next day check for address: " + addressName);
+                        try {
+                            // Open a session
+                            scraperService.openSession();
+
+                            // Use the checkNextDayAddressInSession method to get the next day's schedule
+                            ScrapeResult result = scraperService.checkNextDayAddressInSession(
+                                    info.address().city(), info.address().street(), info.address().houseNum());
+
+                            // Handle the next day scrape result
+                            handleNextDayScrapeResult(info.addressKey(), info.address(), result);
+
+                            // Reset error counter on successful check
+                            addressFailureCount.remove(info.addressKey());
+
+                            // Add the updated group to the set to avoid checking it again for other addresses
+                            if (result.groupName() != null) {
+                                synchronized (groupsUpdatedInCurrentCycle) {
+                                    groupsUpdatedInCurrentCycle.add(result.groupName());
+                                }
+                            }
+
+                        } catch (Exception e) {
+                            System.err.println("[NEXT DAY CHECK] Failed to check " + addressName + ": " + e.getMessage());
+
+                            // Track error count for this address
+                            int failures = addressFailureCount.getOrDefault(info.addressKey(), 0) + 1;
+                            addressFailureCount.put(info.addressKey(), failures);
+
+                            // If the address consistently causes errors, temporarily disable its checking
+                            if (failures >= MAX_FAILURES) {
+                                System.err.println("[NEXT DAY CHECK] Address " + addressName + " has failed " + failures + 
+                                                " times. Temporarily disabling checks for this address.");
+                            }
+                        } finally {
+                            try {
+                                scraperService.closeSession();
+                                Thread.sleep(1000); // Give the OS time to free resources
+                            } catch (Exception e) {
+                                System.err.println("Error closing session: " + e.getMessage());
+                            }
+                        }
+                    } finally {
+                        // Always release the semaphore and count down the latch
+                        checkSemaphore.release();
+                        completionLatch.countDown();
+                        System.out.println(">>> Completed next day check for " + addressName + ". Remaining tasks: " + completionLatch.getCount());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.err.println("[NEXT DAY CHECK] Interrupted while waiting for semaphore: " + e.getMessage());
+                    completionLatch.countDown(); // Ensure latch is counted down even on error
+                    System.out.println(">>> Error for next day check of " + addressName + ". Remaining tasks: " + completionLatch.getCount());
+                } catch (Throwable t) {
+                    System.err.println("[NEXT DAY CHECK] Unexpected error: " + t.getMessage());
+                    t.printStackTrace();
+                    completionLatch.countDown(); // Ensure latch is counted down even on error
+                    System.out.println(">>> Error for next day check of " + addressName + ". Remaining tasks: " + completionLatch.getCount());
+                }
+            });
+        }
+
+        // Log the number of tasks submitted
+        System.out.println("[NEXT DAY CHECK] Submitted " + addressesToCheck.size() + " tasks to the check executor.");
+
+        // Wait for all checks to complete using the CountDownLatch
+        try {
+            System.out.println("[NEXT DAY CHECK] Waiting for all checks to complete...");
+            boolean completed = completionLatch.await(30, TimeUnit.MINUTES); // Add a reasonable timeout
+            if (completed) {
+                System.out.println("[NEXT DAY CHECK] All checks completed successfully.");
+            } else {
+                System.err.println("[NEXT DAY CHECK] Timed out waiting for all checks to complete!");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("[NEXT DAY CHECK] Interrupted while waiting for checks to complete: " + e.getMessage());
+        }
+
+        System.out.println("[NEXT DAY CHECK] Cycle complete.");
+    }
+
+    /**
+     * Checks if it's after midnight (00:00) and before 00:05, and if so, copies the next day schedules to the main schedules.
+     */
+    private void checkAndCopyNextDaySchedules() {
+        LocalTime now = LocalTime.now(TIME_ZONE);
+        if (now.isAfter(LocalTime.of(0, 0)) && now.isBefore(LocalTime.of(0, 5))) {
+            System.out.println("[MIDNIGHT TASK] It's after midnight, copying next day schedules to main schedules...");
+            dbService.copyNextDaySchedulesToMainSchedules();
+            System.out.println("[MIDNIGHT TASK] Next day schedules copied to main schedules.");
+        }
+    }
+
+    /**
+     * Handles the result of a next day scrape operation, updating the next_day_groups table.
+     * This method is similar to handleScrapeResult() but saves to the next_day_groups table.
+     * 
+     * @param addressKey The key of the address that was checked
+     * @param address The address object that was checked
+     * @param result The result of the scrape operation
+     */
+    private void handleNextDayScrapeResult(String addressKey, Address address, ScrapeResult result) {
+        List<TimeInterval> newSchedule = result.schedule();
+        String newGroupName = result.groupName();
+
+        // Update the address-to-group binding (we don't update the timestamp here as it's for the next day)
+        // We still want the regular schedule check to run for today
+
+        // Get the current next day schedule for this group
+        DatabaseService.GroupSchedule oldGroupSched = dbService.getNextDayScheduleForGroup(newGroupName);
+        List<TimeInterval> oldSchedule = (oldGroupSched == null || oldGroupSched.scheduleJson() == null)
+                ? Collections.emptyList() : gson.fromJson(oldGroupSched.scheduleJson(), scheduleListType);
+
+        boolean hasChanged = !oldSchedule.equals(newSchedule);
+
+        if (hasChanged) {
+            System.out.println("[NEXT DAY CHECK] CHANGES DETECTED for next day schedule of group " + newGroupName);
+            // Save the new next day group schedule
+            dbService.saveNextDayScheduleForGroup(newGroupName, newSchedule);
+
+            // We don't notify users here as this is just the next day's schedule
+            // Users will be notified when the schedule becomes the main one after midnight
+        } else {
+            System.out.println("[NEXT DAY CHECK] No changes for next day schedule of group " + newGroupName);
+            // Update the next day group timestamp to mark it as current
+            dbService.saveNextDayScheduleForGroup(newGroupName, newSchedule);
+        }
     }
 
     /**
@@ -169,6 +371,20 @@ public class NotificationService {
         queueTask(() -> {
             Address address = monitoredAddresses.get(addressKey);
             if (address != null) runCheckForSingleAddress_Isolated(addressKey, address, notifyChatId);
+        });
+    }
+
+    /**
+     * Forces a check for the next day's schedule for a single address and notifies the specified user.
+     * 
+     * @param addressKey The key of the address to check
+     * @param notifyChatId The chat ID to notify with the results
+     */
+    public void forceCheckNextDayAddress(String addressKey, long notifyChatId) {
+        System.out.println("Triggering async next day check for " + addressKey + " for user " + notifyChatId);
+        queueTask(() -> {
+            Address address = monitoredAddresses.get(addressKey);
+            if (address != null) runNextDayCheckForSingleAddress_Isolated(addressKey, address, notifyChatId);
         });
     }
 
@@ -353,6 +569,44 @@ public class NotificationService {
         } finally {
             scraperService.closeSession();
             System.out.println("[FORCE CHECK] Browser closed.");
+        }
+    }
+
+    /**
+     * Run an isolated check for the next day's schedule for a single address.
+     * This method opens a new browser session, performs the check, and closes the session.
+     * 
+     * @param addressKey The key of the address to check
+     * @param address The address object to check
+     * @param notifyChatId The chat ID to notify with the results (0 if no notification needed)
+     */
+    private void runNextDayCheckForSingleAddress_Isolated(String addressKey, Address address, long notifyChatId) {
+        System.out.println("[FORCE NEXT DAY CHECK] Running isolated next day check for: " + address.name());
+        try {
+            scraperService.openSession();
+            ScrapeResult result = scraperService.checkNextDayAddressInSession(address.city(), address.street(), address.houseNum());
+
+            // Get the next day schedule
+            DatabaseService.GroupSchedule nextDaySchedule = dbService.getNextDayScheduleForGroup(result.groupName());
+            List<TimeInterval> schedule = (nextDaySchedule == null || nextDaySchedule.scheduleJson() == null)
+                    ? Collections.emptyList() : gson.fromJson(nextDaySchedule.scheduleJson(), scheduleListType);
+
+            // Update the next day schedule in the database
+            handleNextDayScrapeResult(addressKey, address, result);
+
+            // Notify the user
+            if (notifyChatId != 0) {
+                String msg = "💡 *Графік на завтра для " + address.name() + ":*\n\n" + formatSchedule(result.schedule());
+                sendMessageSafely(notifyChatId, msg, "FORCE NEXT DAY CHECK");
+            }
+        } catch (Exception e) {
+            System.err.println("[FORCE NEXT DAY CHECK] FAILURE: " + e.getMessage());
+            if (notifyChatId != 0) {
+                sendMessageSafely(notifyChatId, "❌ Помилка при отриманні даних на завтра (" + e.getMessage() + "). Спробуйте пізніше.", "FORCE NEXT DAY CHECK");
+            }
+        } finally {
+            scraperService.closeSession();
+            System.out.println("[FORCE NEXT DAY CHECK] Browser closed.");
         }
     }
 
