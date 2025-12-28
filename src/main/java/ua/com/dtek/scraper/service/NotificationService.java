@@ -14,11 +14,16 @@ import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
+/**
+ * Service responsible for monitoring electricity outage schedules and notifying users about changes.
+ * Handles scheduled checks, user notifications, and pre-shutdown warnings.
+ * 
+ * @version 8.0.0
+ */
 public class NotificationService {
 
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
@@ -32,9 +37,50 @@ public class NotificationService {
     private final Map<String, Address> monitoredAddresses;
     private final Gson gson = new Gson();
     private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
+    // Parallelism limits
+    private final int MAX_CONCURRENT_CHECKS = 3;  // Maximum number of concurrent checks
+
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    // Separate thread pool for address checking
+    private final ExecutorService checkExecutor = Executors.newFixedThreadPool(MAX_CONCURRENT_CHECKS);
     private DtekScraperBot bot;
 
+    private final Semaphore checkSemaphore = new Semaphore(MAX_CONCURRENT_CHECKS);
+
+    // Task queue
+    private final BlockingQueue<Runnable> taskQueue = new LinkedBlockingQueue<>();
+    private final AtomicBoolean isProcessingQueue = new AtomicBoolean(false);
+
+    /**
+     * Safely runs a task with exception handling to prevent scheduler from stopping.
+     * This is a critical method that ensures background tasks don't crash the scheduler.
+     * 
+     * @param task The task to run
+     */
+    private void safeRun(Runnable task) {
+        try {
+            task.run();
+        } catch (Throwable t) {
+            System.err.println("[SAFE_RUN] Caught exception in scheduled task: " + t.getMessage());
+            t.printStackTrace();
+
+            // If the error is related to Telegram API, mark the bot as unhealthy
+            if (t instanceof org.telegram.telegrambots.meta.exceptions.TelegramApiException) {
+                if (bot != null) {
+                    bot.markBotUnhealthy();
+                }
+            }
+        }
+    }
+
+    /**
+     * Constructor for the NotificationService
+     * 
+     * @param dbService The database service for storing and retrieving data
+     * @param scraperService The scraper service for checking addresses
+     * @param parser The parser for processing schedule data
+     * @param addresses Map of addresses to monitor
+     */
     public NotificationService(DatabaseService dbService, DtekScraperService scraperService, ScheduleParser parser, Map<String, Address> addresses) {
         this.dbService = dbService;
         this.scraperService = scraperService;
@@ -42,26 +88,114 @@ public class NotificationService {
         this.monitoredAddresses = addresses;
     }
 
+    /**
+     * Set the bot instance for sending notifications
+     * 
+     * @param bot The Telegram bot instance
+     */
     public void setBot(DtekScraperBot bot) { this.bot = bot; }
 
-    public void startMonitoring() {
-        System.out.println("Starting background monitoring tasks...");
-        scheduler.scheduleAtFixedRate(this::runFullScheduleCheck, 2, 45, TimeUnit.MINUTES);
-        scheduler.scheduleAtFixedRate(this::runPreShutdownWarningCheck, 1, 10, TimeUnit.MINUTES);
+    /**
+     * Processes tasks from the queue.
+     * Guarantees that only one thread processes the queue at a time.
+     */
+    public void processTaskQueue() {
+        if (isProcessingQueue.compareAndSet(false, true)) {
+            try {
+                Runnable task;
+                while ((task = taskQueue.poll()) != null) {
+                    safeRun(task);
+                }
+            } finally {
+                isProcessingQueue.set(false);
+            }
+        }
     }
 
+    /**
+     * Adds a task to the queue instead of executing it directly.
+     * 
+     * @param task The task to be executed
+     */
+    private void queueTask(Runnable task) {
+        taskQueue.offer(task);
+    }
+
+    /**
+     * Starts the background monitoring tasks for schedule checks and warnings.
+     */
+    public void startMonitoring() {
+        System.out.println("Starting background monitoring tasks...");
+
+        // Start the queue processor
+        scheduler.scheduleWithFixedDelay(this::processTaskQueue, 0, 1, TimeUnit.SECONDS);
+
+        // Scheduled checks
+        scheduler.scheduleAtFixedRate(() -> safeRun(this::runFullScheduleCheck), 2, 45, TimeUnit.MINUTES);
+        scheduler.scheduleAtFixedRate(() -> safeRun(this::runPreShutdownWarningCheck), 1, 10, TimeUnit.MINUTES);
+    }
+
+    /**
+     * Properly shuts down the scheduler and executor to prevent memory leaks.
+     * Should be called when the application is shutting down.
+     */
+    public void shutdown() {
+        ua.com.dtek.scraper.util.SchedulerUtil.shutdownScheduler(scheduler, 10, "[NOTIFICATION] ");
+
+        // Shutdown the check executor
+        System.out.println("[NOTIFICATION] Shutting down check executor...");
+        try {
+            checkExecutor.shutdown();
+            if (!checkExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                System.err.println("[NOTIFICATION] Check executor did not terminate in time, forcing shutdown...");
+                checkExecutor.shutdownNow();
+            }
+            System.out.println("[NOTIFICATION] Check executor shut down successfully.");
+        } catch (InterruptedException e) {
+            System.err.println("[NOTIFICATION] Check executor shutdown interrupted: " + e.getMessage());
+            checkExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Forces a check for a single address and notifies the specified user.
+     * 
+     * @param addressKey The key of the address to check
+     * @param notifyChatId The chat ID to notify with the results
+     */
     public void forceCheckAddress(String addressKey, long notifyChatId) {
         System.out.println("Triggering async check for " + addressKey + " for user " + notifyChatId);
-        scheduler.submit(() -> {
+        queueTask(() -> {
             Address address = monitoredAddresses.get(addressKey);
             if (address != null) runCheckForSingleAddress_Isolated(addressKey, address, notifyChatId);
         });
     }
 
     /**
-     * ОПТИМІЗОВАНИЙ метод перевірки.
-     * 1. Ізоляція сесій (відкрив/закрив) для стабільності.
-     * 2. Кешування груп в межах циклу (не перевіряємо одну групу двічі в одному запуску).
+     * Initiates an unscheduled check of all schedules and notifies about changes.
+     * 
+     * @param initiatorChatId ID of the user who initiated the check (0 if system check)
+     */
+    public void forceCheckAllAddresses(long initiatorChatId) {
+        System.out.println("[FORCE CHECK ALL] Triggering manual check for all addresses initiated by user " + initiatorChatId);
+        queueTask(() -> {
+            if (initiatorChatId != 0) {
+                sendMessageSafely(initiatorChatId, "🔄 Розпочато перевірку графіків для всіх адрес. Це може зайняти деякий час...", "FORCE CHECK ALL");
+            }
+
+            runFullScheduleCheck();
+
+            if (initiatorChatId != 0) {
+                sendMessageSafely(initiatorChatId, "✅ Перевірку графіків завершено. Якщо були зміни, користувачі отримали сповіщення.", "FORCE CHECK ALL");
+            }
+        });
+    }
+
+    /**
+     * OPTIMIZED check method.
+     * 1. Session isolation (open/close) for stability.
+     * 2. Group caching within the cycle (we don't check the same group twice in one run).
      */
     private void runFullScheduleCheck() {
         System.out.println("\n[SCHEDULE CHECK] Running full schedule change check...");
@@ -74,54 +208,137 @@ public class NotificationService {
 
         System.out.println("[SCHEDULE CHECK] Checking " + addressesToCheck.size() + " addresses.");
 
-        // Сет для зберігання груп, які ми ВЖЕ оновили в цьому циклі запуску.
+        // Set for storing groups that we have ALREADY updated in this run cycle
         Set<String> groupsUpdatedInCurrentCycle = new HashSet<>();
 
+        // Tracking error count for addresses
+        Map<String, Integer> addressFailureCount = new ConcurrentHashMap<>();
+        final int MAX_FAILURES = 3;
+
+        // Use CountDownLatch to track completion of all tasks
+        CountDownLatch completionLatch = new CountDownLatch(addressesToCheck.size());
+
+        // Limit the number of concurrent checks
         for (AddressInfo info : addressesToCheck) {
             String addressName = info.address().name();
-            String knownGroup = info.groupName(); // Група, яку ми знаємо з попередніх перевірок
+            String knownGroup = info.groupName(); // Group that we know from previous checks
 
-            // --- ОПТИМІЗАЦІЯ ---
-            // Якщо ми знаємо групу цієї адреси, і ця група вже була оновлена
-            // під час перевірки іншої адреси в цьому ж циклі -> ПРОПУСКАЄМО браузер.
+            // --- OPTIMIZATION ---
+            // If we know the group of this address, and this group has already been updated
+            // during the check of another address in this cycle -> SKIP the browser.
             if (knownGroup != null && groupsUpdatedInCurrentCycle.contains(knownGroup)) {
                 System.out.println(">>> Optimization: Skipping browser for " + addressName + " (Group " + knownGroup + " already updated).");
 
-                // Важливо: Оновлюємо timestamp для цієї адреси, щоб вона не висіла як "застаріла"
+                // Important: Update timestamp for this address so it doesn't appear as "outdated"
                 dbService.updateAddressGroupAndTimestamp(info.addressKey(), knownGroup);
+
+                // Count this as completed since we're skipping it
+                completionLatch.countDown();
                 continue;
             }
             // -------------------
 
-            System.out.println(">>> Processing address: " + addressName);
-            try {
-                // Відкриваємо сесію (тут використовується наш CustomFirefoxProvider з BrowserConfig)
-                scraperService.openSession();
-
-                ScrapeResult result = scraperService.checkAddressInSession(
-                        info.address().city(), info.address().street(), info.address().houseNum());
-
-                handleScrapeResult(info.addressKey(), info.address(), 0, result);
-
-                // Додаємо оновлену групу в сет, щоб не перевіряти її знову для інших адрес
-                if (result.groupName() != null) {
-                    groupsUpdatedInCurrentCycle.add(result.groupName());
-                }
-
-            } catch (Exception e) {
-                System.err.println("[SCHEDULE CHECK] Failed to check " + addressName + ": " + e.getMessage());
-            } finally {
+            // Submit the task to the checkExecutor instead of the scheduler
+            checkExecutor.submit(() -> {
                 try {
-                    scraperService.closeSession();
-                    Thread.sleep(1000); // Даємо час ОС звільнити ресурси
-                } catch (Exception e) {
-                    System.err.println("Error closing session: " + e.getMessage());
+                    // Wait for an available slot with timeout
+                    System.out.println(">>> Waiting for available check slot for " + addressName);
+                    boolean acquired = checkSemaphore.tryAcquire(5, TimeUnit.MINUTES);
+                    if (!acquired) {
+                        System.err.println(">>> Timed out waiting for semaphore for " + addressName);
+                        completionLatch.countDown();
+                        return;
+                    }
+
+                    try {
+                        System.out.println(">>> Processing address: " + addressName);
+                        try {
+                            // Open a session (using our CustomFirefoxProvider from BrowserConfig)
+                            scraperService.openSession();
+
+                            ScrapeResult result = scraperService.checkAddressInSession(
+                                    info.address().city(), info.address().street(), info.address().houseNum());
+
+                            handleScrapeResult(info.addressKey(), info.address(), 0, result);
+
+                            // Reset error counter on successful check
+                            addressFailureCount.remove(info.addressKey());
+
+                            // Add the updated group to the set to avoid checking it again for other addresses
+                            if (result.groupName() != null) {
+                                synchronized (groupsUpdatedInCurrentCycle) {
+                                    groupsUpdatedInCurrentCycle.add(result.groupName());
+                                }
+                            }
+
+                        } catch (Exception e) {
+                            System.err.println("[SCHEDULE CHECK] Failed to check " + addressName + ": " + e.getMessage());
+
+                            // Track error count for this address
+                            int failures = addressFailureCount.getOrDefault(info.addressKey(), 0) + 1;
+                            addressFailureCount.put(info.addressKey(), failures);
+
+                            // If the address consistently causes errors, temporarily disable its checking
+                            if (failures >= MAX_FAILURES) {
+                                System.err.println("[SCHEDULE CHECK] Address " + addressName + " has failed " + failures + 
+                                                " times. Temporarily disabling checks for this address.");
+                            }
+                        } finally {
+                            try {
+                                scraperService.closeSession();
+                                Thread.sleep(1000); // Give the OS time to free resources
+                            } catch (Exception e) {
+                                System.err.println("Error closing session: " + e.getMessage());
+                            }
+                        }
+                    } finally {
+                        // Always release the semaphore and count down the latch
+                        checkSemaphore.release();
+                        completionLatch.countDown();
+                        System.out.println(">>> Completed check for " + addressName + ". Remaining tasks: " + completionLatch.getCount());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.err.println("[SCHEDULE CHECK] Interrupted while waiting for semaphore: " + e.getMessage());
+                    completionLatch.countDown(); // Ensure latch is counted down even on error
+                    System.out.println(">>> Error for " + addressName + ". Remaining tasks: " + completionLatch.getCount());
+                } catch (Throwable t) {
+                    System.err.println("[SCHEDULE CHECK] Unexpected error: " + t.getMessage());
+                    t.printStackTrace();
+                    completionLatch.countDown(); // Ensure latch is counted down even on error
+                    System.out.println(">>> Error for " + addressName + ". Remaining tasks: " + completionLatch.getCount());
                 }
-            }
+            });
         }
+
+        // Log the number of tasks submitted
+        System.out.println("[SCHEDULE CHECK] Submitted " + addressesToCheck.size() + " tasks to the check executor.");
+
+        // Wait for all checks to complete using the CountDownLatch
+        try {
+            System.out.println("[SCHEDULE CHECK] Waiting for all checks to complete...");
+            boolean completed = completionLatch.await(30, TimeUnit.MINUTES); // Add a reasonable timeout
+            if (completed) {
+                System.out.println("[SCHEDULE CHECK] All checks completed successfully.");
+            } else {
+                System.err.println("[SCHEDULE CHECK] Timed out waiting for all checks to complete!");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("[SCHEDULE CHECK] Interrupted while waiting for checks to complete: " + e.getMessage());
+        }
+
         System.out.println("[SCHEDULE CHECK] Cycle complete.");
     }
 
+    /**
+     * Run an isolated check for a single address.
+     * This method opens a new browser session, performs the check, and closes the session.
+     * 
+     * @param addressKey The key of the address to check
+     * @param address The address object to check
+     * @param notifyChatId The chat ID to notify with the results (0 if no notification needed)
+     */
     private void runCheckForSingleAddress_Isolated(String addressKey, Address address, long notifyChatId) {
         System.out.println("[FORCE CHECK] Running isolated check for: " + address.name());
         try {
@@ -130,18 +347,28 @@ public class NotificationService {
             handleScrapeResult(addressKey, address, notifyChatId, result);
         } catch (Exception e) {
             System.err.println("[FORCE CHECK] FAILURE: " + e.getMessage());
-            if (notifyChatId != 0) bot.sendMessage(notifyChatId, "❌ Помилка при отриманні даних (" + e.getMessage() + "). Спробуйте пізніше.");
+            if (notifyChatId != 0) {
+                sendMessageSafely(notifyChatId, "❌ Помилка при отриманні даних (" + e.getMessage() + "). Спробуйте пізніше.", "FORCE CHECK");
+            }
         } finally {
             scraperService.closeSession();
             System.out.println("[FORCE CHECK] Browser closed.");
         }
     }
 
+    /**
+     * Handles the result of a scrape operation, updating the database and notifying users if needed.
+     * 
+     * @param addressKey The key of the address that was checked
+     * @param address The address object that was checked
+     * @param notifyChatId The chat ID to notify with the results (0 if no notification needed)
+     * @param result The result of the scrape operation
+     */
     private void handleScrapeResult(String addressKey, Address address, long notifyChatId, ScrapeResult result) {
         List<TimeInterval> newSchedule = result.schedule();
         String newGroupName = result.groupName();
 
-        // Оновлюємо прив'язку адреси до групи та час перевірки
+        // Update the address-to-group binding and check timestamp
         dbService.updateAddressGroupAndTimestamp(addressKey, newGroupName);
 
         DatabaseService.GroupSchedule oldGroupSched = dbService.getScheduleForGroup(newGroupName);
@@ -152,57 +379,184 @@ public class NotificationService {
 
         if (hasChanged) {
             System.out.println("[CHECK] CHANGES DETECTED for group " + newGroupName);
-            // Зберігаємо новий графік групи
+            // Save the new group schedule
             dbService.saveScheduleForGroup(newGroupName, newSchedule);
 
-            // Сповіщаємо ВСІХ користувачів цієї групи.
+            // Notify ALL users of this group
             List<Long> users = dbService.getUsersForGroup(newGroupName);
-            if (notifyChatId != 0) users.remove(notifyChatId); // Щоб не дублювати повідомлення ініціатору
+            if (notifyChatId != 0) users.remove(notifyChatId); // To avoid duplicate messages to the initiator
             notifyUsers(users, newGroupName, newSchedule, true);
 
             dbService.clearWarnedFlagsForGroup(newGroupName);
         } else {
             System.out.println("[CHECK] No changes for group " + newGroupName);
-            // Оновлюємо timestamp групи ("last_checked"), щоб знати, що вона актуальна
+            // Update the group timestamp ("last_checked") to mark it as current
             dbService.saveScheduleForGroup(newGroupName, newSchedule);
         }
 
         if (notifyChatId != 0) {
             String msg = "💡 *Поточний графік для " + address.name() + ":*\n\n" + formatSchedule(newSchedule);
-            bot.sendMessage(notifyChatId, msg);
+            sendMessageSafely(notifyChatId, msg, "HANDLE RESULT");
         }
     }
 
+    /**
+     * Notifies users about schedule changes
+     * 
+     * @param users List of user IDs to notify
+     * @param groupName The group name for the schedule
+     * @param schedule The new schedule
+     * @param isChange Whether this is a change from the previous schedule
+     */
     private void notifyUsers(List<Long> users, String groupName, List<TimeInterval> schedule, boolean isChange) {
         if (bot == null || users.isEmpty()) return;
         String msg = "✅ *Оновлення графіку!*\nГрупа: *" + groupName + "*\n\n" +
                 (schedule.isEmpty() ? "Відключень немає.\n" : "Новий графік:\n" + formatSchedule(schedule) + "\n") +
                 (isChange ? "_(Минулий графік був іншим)._" : "");
-        for (Long id : users) bot.sendMessage(id, msg);
+        sendMessageToUsers(users, msg, "NOTIFICATION");
     }
 
+    /**
+     * Runs a check for upcoming outages to send pre-shutdown warnings
+     */
     private void runPreShutdownWarningCheck() {
         String now = LocalTime.now(TIME_ZONE).format(TIME_FORMATTER);
         System.out.println("\n[PRE-WARN CHECK] " + now);
+
         try {
             for (String key : monitoredAddresses.keySet()) {
-                String group = dbService.getGroupForAddress(key);
-                if (group == null) continue;
-                DatabaseService.GroupSchedule gs = dbService.getScheduleForGroup(group);
-                if (gs == null || gs.scheduleJson() == null) continue;
-                List<TimeInterval> sched = gson.fromJson(gs.scheduleJson(), scheduleListType);
-                List<TimeInterval> upcoming = scheduleParser.findUpcomingShutdowns(sched);
-                for (TimeInterval ti : upcoming) {
-                    List<Long> users = dbService.getUsersToWarn(key, ti.startTime());
-                    if (users.isEmpty()) continue;
-                    String msg = "❗️ *Увага!* (" + monitoredAddresses.get(key).name() + ")\nПланується відключення о `" + ti.startTime() + "`.";
-                    for (Long u : users) bot.sendMessage(u, msg);
-                    dbService.markUsersAsWarned(users, key, ti.startTime());
-                }
+                processAddressForWarning(key);
             }
-        } catch (Exception e) { e.printStackTrace(); }
+        } catch (Exception e) {
+            System.err.println("[PRE-WARN] Critical error in warning check: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 
+    /**
+     * Process a single address for pre-shutdown warnings.
+     * Checks if there are any upcoming outages for the address and sends warnings to users.
+     * 
+     * @param key The address key to process
+     */
+    private void processAddressForWarning(String key) {
+        try {
+            String group = dbService.getGroupForAddress(key);
+            if (group == null) return;
+
+            DatabaseService.GroupSchedule gs = dbService.getScheduleForGroup(group);
+            if (gs == null || gs.scheduleJson() == null) return;
+
+            List<TimeInterval> sched = gson.fromJson(gs.scheduleJson(), scheduleListType);
+            List<TimeInterval> upcoming = scheduleParser.findUpcomingShutdowns(sched);
+
+            for (TimeInterval ti : upcoming) {
+                processTimeIntervalWarning(key, ti);
+            }
+        } catch (Exception e) {
+            System.err.println("[PRE-WARN] Error processing address key " + key + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Process warnings for a specific time interval.
+     * 
+     * @param key The address key
+     * @param ti The time interval
+     */
+    private void processTimeIntervalWarning(String key, TimeInterval ti) {
+        try {
+            List<Long> users = dbService.getUsersToWarn(key, ti.startTime());
+            if (users.isEmpty()) return;
+
+            String msg = "❗️ *Увага!* (" + monitoredAddresses.get(key).name() + ")\nПланується відключення о `" + ti.startTime() + "`.";
+            sendWarningToUsers(users, msg);
+            dbService.markUsersAsWarned(users, key, ti.startTime());
+        } catch (Exception e) {
+            System.err.println("[PRE-WARN] Error processing time interval " + ti + " for key " + key + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Helper method to safely send a message to a user with error handling
+     * 
+     * @param userId The user's chat ID
+     * @param message The message to send
+     * @param logTag The tag to use in error logs
+     * @return true if the message was sent successfully, false otherwise
+     */
+    private boolean sendMessageSafely(long userId, String message, String logTag) {
+        try {
+            return bot.sendMessage(userId, message);
+        } catch (Exception e) {
+            System.err.println("[" + logTag + "] Failed to send message to user " + userId + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Send messages to multiple users with error handling for each user
+     * 
+     * @param users The list of user IDs
+     * @param message The message to send
+     * @param logTag The tag to use in error logs
+     */
+    private void sendMessageToUsers(List<Long> users, String message, String logTag) {
+        for (Long userId : users) {
+            sendMessageSafely(userId, message, logTag);
+        }
+    }
+
+    /**
+     * Send warning messages to multiple users
+     * 
+     * @param users The list of user IDs
+     * @param message The warning message to send
+     */
+    private void sendWarningToUsers(List<Long> users, String message) {
+        sendMessageToUsers(users, message, "PRE-WARN");
+    }
+
+    /**
+     * Broadcast a message to all users
+     * 
+     * @param message The message to broadcast
+     * @param initiatorChatId The chat ID of the user who initiated the broadcast (will be excluded from recipients)
+     * @return The number of users who successfully received the message
+     */
+    public int broadcastToAllUsers(String message, long initiatorChatId) {
+        if (bot == null) return 0;
+
+        List<Long> allUsers = dbService.getAllUsers();
+        int successCount = 0;
+
+        for (Long userId : allUsers) {
+            // Skip sending to the initiator
+            if (userId == initiatorChatId) continue;
+
+            try {
+                if (sendMessageSafely(userId, message, "BROADCAST")) {
+                    successCount++;
+                }
+
+                // Add a small delay to avoid hitting Telegram API limits
+                Thread.sleep(50);
+            } catch (Exception e) {
+                System.err.println("[BROADCAST] Failed to send message to user " + userId + ": " + e.getMessage());
+            }
+        }
+
+        return successCount;
+    }
+
+    /**
+     * Format a list of time intervals into a readable schedule string
+     * 
+     * @param schedule The list of time intervals
+     * @return A formatted string representation of the schedule
+     */
     private String formatSchedule(List<TimeInterval> schedule) {
         if (schedule == null || schedule.isEmpty()) return "Відключень немає.";
         return schedule.stream().map(i -> "•  `" + i.startTime() + " - " + i.endTime() + "`").collect(Collectors.joining("\n"));

@@ -82,11 +82,39 @@ public class SchedulePage {
 
     /**
      * Helper method to perform the click -> type -> select workflow.
+     * Includes explicit waits for elements to be enabled before interacting with them.
+     * Has fallback mechanism for when dropdown doesn't appear.
      */
     private void fillAndSelect(SelenideElement input, String text, SelenideElement dropdownItem) {
+        // Wait for input to be enabled before clicking
+        input.shouldBe(enabled, Duration.ofSeconds(10));
         input.click();
+
+        // Wait again after click to ensure it's ready for input
+        input.shouldBe(enabled, Duration.ofSeconds(5));
         input.sendKeys(text);
-        dropdownItem.shouldBe(visible).click();
+
+        // Try to select from dropdown with fallback
+        try {
+            // Wait for dropdown item to be visible with increased timeout
+            dropdownItem.shouldBe(visible, Duration.ofSeconds(15));
+            dropdownItem.shouldBe(enabled, Duration.ofSeconds(5));
+            dropdownItem.click();
+        } catch (Exception e) {
+            System.out.println("Dropdown item not found or not clickable. Trying fallback approach...");
+
+            // Fallback: Press Enter key to submit the input
+            input.pressEnter();
+
+            System.out.println("Used fallback approach (Enter key) for input: " + text);
+        }
+
+        // Wait a moment after selection to allow UI to update
+        try {
+            Thread.sleep(1000); // Increased wait time
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**

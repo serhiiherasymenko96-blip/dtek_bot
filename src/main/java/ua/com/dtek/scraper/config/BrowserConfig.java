@@ -7,13 +7,6 @@ import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.firefox.FirefoxDriver;
 import org.openqa.selenium.firefox.FirefoxOptions;
 
-/**
- * Конфігурація браузера через Custom Provider.
- * Це єдиний надійний спосіб повністю вимкнути BiDi (WebSocket) у Selenide 7+,
- * щоб уникнути NullPointerException при читанні логів Firefox.
- *
- * @version 7.2.1 (Fixed: Removed javax.annotation to fix compilation error)
- */
 public final class BrowserConfig {
 
     public static final String DTEK_URL = "https://www.dtek-dnem.com.ua/ua/shutdowns";
@@ -22,53 +15,51 @@ public final class BrowserConfig {
     }
 
     public static void setupSelenide() {
-        // Замість "firefox" вказуємо наш клас-провайдер.
         Configuration.browser = CustomFirefoxProvider.class.getName();
-
         Configuration.browserSize = "1366x768";
+
+        // Вмикаємо headless режим для продакшену
         Configuration.headless = true;
 
-        // Збільшуємо таймаути
         Configuration.timeout = 20000;
         Configuration.pageLoadTimeout = 60000;
-
         Configuration.screenshots = false;
         Configuration.savePageSource = false;
     }
 
-    /**
-     * Кастомний провайдер драйвера.
-     * Ми створюємо FirefoxDriver вручну, щоб Selenide не додавав свої listeners автоматично.
-     */
     public static class CustomFirefoxProvider implements WebDriverProvider {
 
-        // Видалено анотації @Nonnull, щоб уникнути помилок компіляції без зайвих залежностей
         @Override
         public WebDriver createDriver(Capabilities capabilities) {
             FirefoxOptions options = new FirefoxOptions();
 
-            // --- ОСНОВНІ НАЛАШТУВАННЯ ---
+            System.out.println(">>> Initializing Custom Firefox Driver (Headless Mode) <<<");
+
             options.addArguments("-headless");
             options.addArguments("--no-sandbox");
             options.addArguments("--disable-dev-shm-usage");
 
-            // --- CRITICAL FIX: ВИМИКАЄМО BIDI ---
-            // webSocketUrl: null каже Selenium не ініціювати WebSocket з'єднання взагалі.
-            // Це має зупинити потік "BiDi Connection", який падає.
+            // Вимикаємо BiDi (Fix для WebSocket error)
             options.setCapability("webSocketUrl", (Object) null);
             options.setCapability("se:bidiEnabled", false);
 
-            // --- ОПТИМІЗАЦІЯ РЕСУРСІВ (RAM/CPU) ---
-            options.addPreference("permissions.default.image", 2); // Блокуємо картинки
-            options.addPreference("permissions.default.stylesheet", 2); // Блокуємо CSS (якщо парсеру не треба)
-            options.addPreference("media.autoplay.default", 0);
-            options.addPreference("dom.ipc.processCount", 1); // Мінімум процесів
+            // Оптимізації Firefox для зменшення використання пам'яті
+            options.addPreference("dom.ipc.processCount", 1); // Обмежуємо кількість процесів
+            options.addPreference("permissions.default.image", 2); // Вимикаємо завантаження зображень
+
+            // Додаткові оптимізації для зменшення споживання ресурсів
+            options.addPreference("browser.cache.disk.enable", false);  // Вимкнути кеш на диску
+            options.addPreference("browser.cache.memory.enable", false);  // Вимкнути кеш в пам'яті
+            options.addPreference("browser.sessionhistory.max_entries", 2);  // Обмежити історію сесії
+            options.addPreference("network.http.pipelining", true);  // Увімкнути HTTP pipelining
+            options.addPreference("network.http.proxy.pipelining", true);
+            options.addPreference("network.http.pipelining.maxrequests", 8);
+            options.addPreference("browser.sessionstore.interval", 60000 * 30);  // Рідше зберігати стан сесії
 
             // User Agent
             String userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0";
             options.addPreference("general.useragent.override", userAgent);
 
-            // Об'єднуємо з capabilities, які міг передати Selenide
             options.merge(capabilities);
 
             return new FirefoxDriver(options);

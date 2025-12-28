@@ -14,10 +14,23 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+/**
+ * Parser for DTEK electricity outage schedules.
+ * Extracts time intervals from HTML tables and processes them into a list of outage periods.
+ * 
+ * @version 8.0.0
+ */
 public class ScheduleParser {
 
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
 
+    /**
+     * Parses HTML table content into a list of time intervals representing outage periods.
+     * 
+     * @param tableHtml The HTML content of the schedule table
+     * @return A sorted list of time intervals representing outage periods
+     * @throws RuntimeException If there's a mismatch between cells and headers
+     */
     public List<TimeInterval> parse(String tableHtml) {
         System.out.println("--- Parsing table HTML ---");
         Document doc = Jsoup.parse(tableHtml);
@@ -45,18 +58,23 @@ public class ScheduleParser {
             }
         }
 
-        // ANTI-SPAM: Sort intervals to ensure consistency
-        outageIntervals.sort(Comparator.comparing(TimeInterval::startTime));
-
+        // No need to sort before merging as we'll sort after
         List<TimeInterval> mergedIntervals = mergeIntervals(outageIntervals);
 
-        // Sort again after merging
+        // Sort after merging to ensure consistency
         mergedIntervals.sort(Comparator.comparing(TimeInterval::startTime));
 
         System.out.println("--- Parsing complete: Found " + mergedIntervals.size() + " intervals. ---");
         return mergedIntervals;
     }
 
+    /**
+     * Finds upcoming shutdowns that are scheduled to start in the next 30-40 minutes.
+     * Used for sending pre-shutdown warning notifications to users.
+     * 
+     * @param schedule The list of time intervals to check
+     * @return A list of time intervals that are scheduled to start in the next 30-40 minutes
+     */
     public List<TimeInterval> findUpcomingShutdowns(List<TimeInterval> schedule) {
         LocalTime now = LocalTime.now(java.time.ZoneId.of("Europe/Kyiv"));
         LocalTime warningStartTime = now.plusMinutes(30);
@@ -72,6 +90,13 @@ public class ScheduleParser {
                 .collect(Collectors.toList());
     }
 
+    /**
+     * Merges adjacent time intervals into continuous periods.
+     * For example, 10:00-11:00 and 11:00-12:00 would be merged into 10:00-12:00.
+     * 
+     * @param intervals The list of time intervals to merge
+     * @return A list of merged time intervals
+     */
     private List<TimeInterval> mergeIntervals(List<TimeInterval> intervals) {
         if (intervals.isEmpty()) return new ArrayList<>();
         LinkedList<TimeInterval> merged = new LinkedList<>();
@@ -88,6 +113,14 @@ public class ScheduleParser {
         return merged;
     }
 
+    /**
+     * Parses a cell's class name and time slot to determine if it represents an outage period.
+     * Different cell classes represent different types of outages (full hour, first half, second half).
+     * 
+     * @param className The CSS class name of the cell
+     * @param timeSlot The time slot string (e.g., "10-11")
+     * @return A TimeInterval object if the cell represents an outage, null otherwise
+     */
     private TimeInterval parseCellClass(String className, String timeSlot) {
         String[] timeParts = timeSlot.split("-");
         if (timeParts.length < 2) return null;

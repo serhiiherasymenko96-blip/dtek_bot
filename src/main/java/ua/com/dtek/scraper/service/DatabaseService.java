@@ -5,22 +5,28 @@ import ua.com.dtek.scraper.dto.Address;
 import ua.com.dtek.scraper.dto.AddressInfo;
 import ua.com.dtek.scraper.dto.TimeInterval;
 
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
 public class DatabaseService {
 
     private final String dbUrl;
+    private final String databasePath;
     private final Map<String, Address> monitoredAddresses;
     private final Gson gson = new Gson();
+    private Connection connection;
 
     public DatabaseService(String dbPath, Map<String, Address> addresses) {
+        this.databasePath = dbPath;
         this.dbUrl = "jdbc:sqlite:" + dbPath;
         this.monitoredAddresses = addresses;
         System.out.println("Database service initialized. DB file at: " + dbPath);
@@ -73,26 +79,38 @@ public class DatabaseService {
 
         String sql = "SELECT a.address_key, a.group_name, a.group_last_checked FROM addresses a LEFT JOIN groups g ON a.group_name = g.group_name WHERE a.group_name IS NULL OR a.group_last_checked < ? OR g.last_checked IS NULL OR g.last_checked < ?";
 
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
             ps.setLong(1, groupCutoff);
             ps.setLong(2, cacheCutoff);
-            ResultSet rs = ps.executeQuery();
-            while (rs.next()) {
-                String key = rs.getString("address_key");
-                if (monitoredAddresses.containsKey(key)) {
-                    list.add(new AddressInfo(key, monitoredAddresses.get(key), rs.getString("group_name"), rs.getLong("group_last_checked")));
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String key = rs.getString("address_key");
+                    if (monitoredAddresses.containsKey(key)) {
+                        list.add(new AddressInfo(key, monitoredAddresses.get(key), rs.getString("group_name"), rs.getLong("group_last_checked")));
+                    }
                 }
             }
-        } catch (SQLException e) { e.printStackTrace(); }
+        } catch (SQLException e) {
+            System.err.println("Error getting addresses for full check: " + e.getMessage());
+            e.printStackTrace();
+        }
         return list;
     }
 
     public String getGroupForAddress(String key) {
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("SELECT group_name FROM addresses WHERE address_key = ?")) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT group_name FROM addresses WHERE address_key = ?")) {
             ps.setString(1, key);
-            ResultSet rs = ps.executeQuery();
-            if (rs.next()) return rs.getString("group_name");
-        } catch (SQLException e) { e.printStackTrace(); }
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getString("group_name");
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting group for address: " + e.getMessage());
+            e.printStackTrace();
+        }
         return null;
     }
 
@@ -115,22 +133,52 @@ public class DatabaseService {
     }
 
     public GroupSchedule getScheduleForGroup(String group) {
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("SELECT schedule_json, last_checked FROM groups WHERE group_name = ?")) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT schedule_json, last_checked FROM groups WHERE group_name = ?")) {
             ps.setString(1, group);
-            ResultSet rs = ps.executeQuery();
-            if (rs.next()) return new GroupSchedule(rs.getString("schedule_json"), rs.getLong("last_checked"));
-        } catch (SQLException e) { e.printStackTrace(); }
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return new GroupSchedule(rs.getString("schedule_json"), rs.getLong("last_checked"));
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting schedule for group: " + e.getMessage());
+            e.printStackTrace();
+        }
         return null;
     }
     public record GroupSchedule(String scheduleJson, long lastChecked) {}
 
     public List<Long> getUsersForGroup(String group) {
         List<Long> ids = new ArrayList<>();
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("SELECT u.chat_id FROM users u JOIN addresses a ON u.subscribed_address_key = a.address_key WHERE a.group_name = ?")) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT u.chat_id FROM users u JOIN addresses a ON u.subscribed_address_key = a.address_key WHERE a.group_name = ?")) {
             ps.setString(1, group);
-            ResultSet rs = ps.executeQuery();
-            while (rs.next()) ids.add(rs.getLong("chat_id"));
-        } catch (SQLException e) { e.printStackTrace(); }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) ids.add(rs.getLong("chat_id"));
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting users for group: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return ids;
+    }
+
+    /**
+     * Gets all users from the database
+     * 
+     * @return List of all user chat IDs
+     */
+    public List<Long> getAllUsers() {
+        List<Long> ids = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT chat_id FROM users");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                ids.add(rs.getLong("chat_id"));
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting all users: " + e.getMessage());
+            e.printStackTrace();
+        }
         return ids;
     }
 
@@ -142,31 +190,46 @@ public class DatabaseService {
     }
 
     // User methods
-    public void setUserAddress(long chatId, String key) {
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("INSERT OR REPLACE INTO users (chat_id, subscribed_address_key) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET subscribed_address_key = excluded.subscribed_address_key")) {
+    /**
+     * Generic method to update a user property in the database
+     * 
+     * @param chatId The user's chat ID
+     * @param columnName The column name to update
+     * @param value The value to set
+     */
+    private void updateUserProperty(long chatId, String columnName, String value) {
+        String sql = "INSERT OR REPLACE INTO users (chat_id, " + columnName + ") VALUES (?, ?) " +
+                     "ON CONFLICT(chat_id) DO UPDATE SET " + columnName + " = excluded." + columnName;
+        try (Connection conn = DriverManager.getConnection(dbUrl); 
+             PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setLong(1, chatId);
-            ps.setString(2, key);
+            ps.setString(2, value);
             ps.executeUpdate();
         } catch (SQLException e) { e.printStackTrace(); }
     }
 
+    public void setUserAddress(long chatId, String key) {
+        updateUserProperty(chatId, "subscribed_address_key", key);
+    }
+
     public void updateUserName(long chatId, String name) {
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("INSERT OR REPLACE INTO users (chat_id, first_name) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET first_name = excluded.first_name")) {
-            ps.setLong(1, chatId);
-            ps.setString(2, name);
-            ps.executeUpdate();
-        } catch (SQLException e) { e.printStackTrace(); }
+        updateUserProperty(chatId, "first_name", name);
     }
 
     public List<Long> getUsersToWarn(String key, String time) {
         List<Long> ids = new ArrayList<>();
-        try (Connection conn = DriverManager.getConnection(dbUrl); PreparedStatement ps = conn.prepareStatement("SELECT u.chat_id FROM users u LEFT JOIN warned_users w ON u.chat_id = w.chat_id AND w.address_key = ? AND w.outage_start_time = ? WHERE u.subscribed_address_key = ? AND w.id IS NULL")) {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement ps = conn.prepareStatement("SELECT u.chat_id FROM users u LEFT JOIN warned_users w ON u.chat_id = w.chat_id AND w.address_key = ? AND w.outage_start_time = ? WHERE u.subscribed_address_key = ? AND w.id IS NULL")) {
             ps.setString(1, key);
             ps.setString(2, time);
             ps.setString(3, key);
-            ResultSet rs = ps.executeQuery();
-            while (rs.next()) ids.add(rs.getLong("chat_id"));
-        } catch (SQLException e) { e.printStackTrace(); }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) ids.add(rs.getLong("chat_id"));
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting users to warn: " + e.getMessage());
+            e.printStackTrace();
+        }
         return ids;
     }
 
@@ -180,5 +243,74 @@ public class DatabaseService {
             }
             ps.executeBatch();
         } catch (SQLException e) { e.printStackTrace(); }
+    }
+
+    /**
+     * Creates a backup of the database file.
+     * Closes the current connection before backup and reopens it after.
+     */
+    public void backupDatabase() {
+        String backupPath = databasePath + ".backup-" + System.currentTimeMillis();
+
+        try {
+            // Закриваємо з'єднання перед копіюванням
+            if (connection != null && !connection.isClosed()) {
+                connection.close();
+            }
+
+            // Копіюємо файл бази даних
+            Files.copy(Paths.get(databasePath), Paths.get(backupPath));
+            System.out.println("[BACKUP] Database backed up to: " + backupPath);
+
+            // Видаляємо старі резервні копії (залишаємо останні 5)
+            cleanupOldBackups(5);
+
+            // Відновлюємо з'єднання
+            connection = DriverManager.getConnection(dbUrl);
+        } catch (Exception e) {
+            System.err.println("[BACKUP] Failed to backup database: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Cleans up old database backups, keeping only the specified number of most recent backups.
+     * 
+     * @param keepCount Number of recent backups to keep
+     */
+    private void cleanupOldBackups(int keepCount) {
+        try {
+            File dir = new File(Paths.get(databasePath).getParent().toString());
+            String baseName = Paths.get(databasePath).getFileName().toString();
+
+            File[] backups = dir.listFiles((d, name) -> name.startsWith(baseName + ".backup-"));
+            if (backups != null && backups.length > keepCount) {
+                // Сортуємо за часом створення (від найновіших до найстаріших)
+                Arrays.sort(backups, Comparator.comparingLong(File::lastModified).reversed());
+
+                // Видаляємо старі резервні копії
+                for (int i = keepCount; i < backups.length; i++) {
+                    if (backups[i].delete()) {
+                        System.out.println("[BACKUP] Deleted old backup: " + backups[i].getName());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[BACKUP] Error cleaning up old backups: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Gets the size of the database file in bytes.
+     * 
+     * @return Size of the database file in bytes, or -1 if an error occurs
+     */
+    public long getDatabaseSize() {
+        try {
+            File dbFile = new File(databasePath);
+            return dbFile.length();
+        } catch (Exception e) {
+            System.err.println("Error getting database size: " + e.getMessage());
+            return -1;
+        }
     }
 }
