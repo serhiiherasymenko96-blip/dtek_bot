@@ -38,7 +38,7 @@ public class NotificationService {
     private final Gson gson = new Gson();
     private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
     // Parallelism limits
-    private final int MAX_CONCURRENT_CHECKS = 3;  // Maximum number of concurrent checks
+    private final int MAX_CONCURRENT_CHECKS = 1;  // Maximum number of concurrent checks
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     // Separate thread pool for address checking
