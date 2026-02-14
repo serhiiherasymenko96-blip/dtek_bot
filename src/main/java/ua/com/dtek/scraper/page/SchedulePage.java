@@ -124,13 +124,21 @@ public class SchedulePage {
 
     /**
      * Waits for and retrieves the text from the group name element.
+     * Removes the "Черга " prefix if present.
      *
-     * @return The text of the group (e.g., "Group 5.1").
+     * @return The text of the group (e.g., "3.1").
      */
     public String getGroupName() {
         try {
             groupNameSpan.shouldBe(visible).shouldNotBe(empty, Duration.ofSeconds(10));
-            return groupNameSpan.getText();
+            String groupName = groupNameSpan.getText();
+            
+            // Remove "Черга " prefix if present
+            if (groupName != null && groupName.startsWith("Черга ")) {
+                groupName = groupName.substring("Черга ".length());
+            }
+            
+            return groupName;
         } catch (Exception e) {
             System.err.println("Could not find #group-name: " + e.getMessage());
             return "Group not found";

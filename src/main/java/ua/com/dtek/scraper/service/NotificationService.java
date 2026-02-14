@@ -38,18 +38,40 @@ public class NotificationService {
     private final Gson gson = new Gson();
     private final Type scheduleListType = new TypeToken<List<TimeInterval>>() {}.getType();
     // Parallelism limits
-    private final int MAX_CONCURRENT_CHECKS = 1;  // Maximum number of concurrent checks
+    private final int MAX_CONCURRENT_CHECKS;  // Maximum number of concurrent checks
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     // Separate thread pool for address checking
-    private final ExecutorService checkExecutor = Executors.newFixedThreadPool(MAX_CONCURRENT_CHECKS);
+    private final ExecutorService checkExecutor;
     private DtekScraperBot bot;
 
-    private final Semaphore checkSemaphore = new Semaphore(MAX_CONCURRENT_CHECKS);
+    private final Semaphore checkSemaphore;
 
     // Task queue
     private final BlockingQueue<Runnable> taskQueue = new LinkedBlockingQueue<>();
     private final AtomicBoolean isProcessingQueue = new AtomicBoolean(false);
+
+    // Notification batching queue
+    private final BlockingQueue<PendingNotification> notificationQueue = new LinkedBlockingQueue<>();
+    
+    /**
+     * Inner class to hold pending notification data
+     */
+    private static class PendingNotification {
+        final List<Long> users;
+        final String groupName;
+        final List<TimeInterval> schedule;
+        final boolean isChange;
+        final long timestamp;
+        
+        PendingNotification(List<Long> users, String groupName, List<TimeInterval> schedule, boolean isChange) {
+            this.users = new ArrayList<>(users);
+            this.groupName = groupName;
+            this.schedule = new ArrayList<>(schedule);
+            this.isChange = isChange;
+            this.timestamp = System.currentTimeMillis();
+        }
+    }
 
     /**
      * Safely runs a task with exception handling to prevent scheduler from stopping.
@@ -80,12 +102,18 @@ public class NotificationService {
      * @param scraperService The scraper service for checking addresses
      * @param parser The parser for processing schedule data
      * @param addresses Map of addresses to monitor
+     * @param maxConcurrentChecks Maximum number of concurrent address checks
      */
-    public NotificationService(DatabaseService dbService, DtekScraperService scraperService, ScheduleParser parser, Map<String, Address> addresses) {
+    public NotificationService(DatabaseService dbService, DtekScraperService scraperService, ScheduleParser parser, Map<String, Address> addresses, int maxConcurrentChecks) {
         this.dbService = dbService;
         this.scraperService = scraperService;
         this.scheduleParser = parser;
         this.monitoredAddresses = addresses;
+        this.MAX_CONCURRENT_CHECKS = maxConcurrentChecks;
+        this.checkExecutor = Executors.newFixedThreadPool(maxConcurrentChecks);
+        this.checkSemaphore = new Semaphore(maxConcurrentChecks);
+        
+        System.out.println("[NOTIFICATION SERVICE] Initialized with " + maxConcurrentChecks + " concurrent check threads");
     }
 
     /**
@@ -122,6 +150,52 @@ public class NotificationService {
     }
 
     /**
+     * Processes all pending notifications from the queue in batches.
+     * Respects Telegram API rate limits by adding delays between messages.
+     */
+    private void processNotificationBatch() {
+        if (notificationQueue.isEmpty()) {
+            return;
+        }
+
+        System.out.println("\n[NOTIFICATION BATCH] Processing queued notifications...");
+        int processedCount = 0;
+        List<PendingNotification> batch = new ArrayList<>();
+        
+        // Drain all pending notifications
+        notificationQueue.drainTo(batch);
+        
+        if (batch.isEmpty()) {
+            return;
+        }
+
+        System.out.println("[NOTIFICATION BATCH] Processing " + batch.size() + " pending notifications.");
+
+        // Process each notification
+        for (PendingNotification notification : batch) {
+            try {
+                if (bot == null || notification.users.isEmpty()) {
+                    continue;
+                }
+                
+                String msg = "✅ *Оновлення графіку!*\nГрупа: *" + notification.groupName + "*\n\n" +
+                        (notification.schedule.isEmpty() ? "Відключень немає.\n" : "Новий графік:\n" + formatSchedule(notification.schedule) + "\n") +
+                        (notification.isChange ? "_(Минулий графік був іншим)._" : "");
+                
+                // Send to all users with rate limiting
+                sendMessageToUsers(notification.users, msg, "NOTIFICATION BATCH");
+                processedCount++;
+                
+            } catch (Exception e) {
+                System.err.println("[NOTIFICATION BATCH] Error processing notification for group " + 
+                                 notification.groupName + ": " + e.getMessage());
+            }
+        }
+
+        System.out.println("[NOTIFICATION BATCH] Successfully processed " + processedCount + " notifications.");
+    }
+
+    /**
      * Starts the background monitoring tasks for schedule checks and warnings.
      */
     public void startMonitoring() {
@@ -130,8 +204,11 @@ public class NotificationService {
         // Start the queue processor
         scheduler.scheduleWithFixedDelay(this::processTaskQueue, 0, 1, TimeUnit.SECONDS);
 
+        // Notification batch processor (every 5 minutes)
+        scheduler.scheduleAtFixedRate(() -> safeRun(this::processNotificationBatch), 1, 5, TimeUnit.MINUTES);
+
         // Scheduled checks
-        scheduler.scheduleAtFixedRate(() -> safeRun(this::runFullScheduleCheck), 2, 45, TimeUnit.MINUTES);
+        scheduler.scheduleAtFixedRate(() -> safeRun(this::runFullScheduleCheck), 2, 10, TimeUnit.MINUTES);
         scheduler.scheduleAtFixedRate(() -> safeRun(this::runPreShutdownWarningCheck), 1, 10, TimeUnit.MINUTES);
 
         // Schedule next day checks (hourly after 20:00)
@@ -304,6 +381,7 @@ public class NotificationService {
     /**
      * Handles the result of a next day scrape operation, updating the next_day_groups table.
      * This method is similar to handleScrapeResult() but saves to the next_day_groups table.
+     * If tomorrow's schedule appears for the first time, notifies all subscribed users.
      * 
      * @param addressKey The key of the address that was checked
      * @param address The address object that was checked
@@ -322,14 +400,28 @@ public class NotificationService {
                 ? Collections.emptyList() : gson.fromJson(oldGroupSched.scheduleJson(), scheduleListType);
 
         boolean hasChanged = !oldSchedule.equals(newSchedule);
+        
+        // Detect if this is the first appearance of tomorrow's schedule
+        // This happens when: the schedule didn't exist before (oldGroupSched was null)
+        // We notify regardless of whether the new schedule is empty or has outages
+        boolean isFirstAppearance = (oldGroupSched == null);
 
         if (hasChanged) {
             System.out.println("[NEXT DAY CHECK] CHANGES DETECTED for next day schedule of group " + newGroupName);
             // Save the new next day group schedule
             dbService.saveNextDayScheduleForGroup(newGroupName, newSchedule);
 
-            // We don't notify users here as this is just the next day's schedule
-            // Users will be notified when the schedule becomes the main one after midnight
+            // If this is the first appearance of tomorrow's schedule, notify all users
+            if (isFirstAppearance) {
+                System.out.println("[NEXT DAY CHECK] Tomorrow's schedule is now available for group " + newGroupName + ". Notifying users...");
+                List<Long> usersToNotify = dbService.getUsersForGroup(newGroupName);
+                
+                if (!usersToNotify.isEmpty()) {
+                    // Send notification about tomorrow's schedule availability
+                    notifyUsersAboutNextDaySchedule(usersToNotify, newGroupName, newSchedule);
+                    System.out.println("[NEXT DAY CHECK] Notified " + usersToNotify.size() + " users about tomorrow's schedule.");
+                }
+            }
         } else {
             System.out.println("[NEXT DAY CHECK] No changes for next day schedule of group " + newGroupName);
             // Update the next day group timestamp to mark it as current
@@ -649,13 +741,25 @@ public class NotificationService {
         }
 
         if (notifyChatId != 0) {
-            String msg = "💡 *Поточний графік для " + address.name() + ":*\n\n" + formatSchedule(newSchedule);
+            String msg;
+            if (hasChanged) {
+                msg = "✅ *Виявлено зміни в графіку!*\n" +
+                      "Адреса: " + address.name() + "\n" +
+                      "Група: *" + newGroupName + "*\n\n" +
+                      "Новий графік:\n" + formatSchedule(newSchedule);
+            } else {
+                msg = "ℹ️ *Змін по графіку немає*\n" +
+                      "Адреса: " + address.name() + "\n" +
+                      "Група: *" + newGroupName + "*\n\n" +
+                      "Поточний графік:\n" + formatSchedule(newSchedule);
+            }
             sendMessageSafely(notifyChatId, msg, "HANDLE RESULT");
         }
     }
 
     /**
-     * Notifies users about schedule changes
+     * Notifies users about schedule changes by queuing the notification for batch processing.
+     * Notifications are processed every 5 minutes to optimize Telegram API usage.
      * 
      * @param users List of user IDs to notify
      * @param groupName The group name for the schedule
@@ -664,10 +768,29 @@ public class NotificationService {
      */
     private void notifyUsers(List<Long> users, String groupName, List<TimeInterval> schedule, boolean isChange) {
         if (bot == null || users.isEmpty()) return;
-        String msg = "✅ *Оновлення графіку!*\nГрупа: *" + groupName + "*\n\n" +
-                (schedule.isEmpty() ? "Відключень немає.\n" : "Новий графік:\n" + formatSchedule(schedule) + "\n") +
-                (isChange ? "_(Минулий графік був іншим)._" : "");
-        sendMessageToUsers(users, msg, "NOTIFICATION");
+        
+        // Queue notification for batch processing
+        PendingNotification notification = new PendingNotification(users, groupName, schedule, isChange);
+        notificationQueue.offer(notification);
+        System.out.println("[NOTIFICATION] Queued notification for group " + groupName + " (" + users.size() + " users). Queue size: " + notificationQueue.size());
+    }
+
+    /**
+     * Notifies users about tomorrow's schedule becoming available.
+     * Sends the notification immediately without queuing, as this is time-sensitive information.
+     * 
+     * @param users List of user IDs to notify
+     * @param groupName The group name for the schedule
+     * @param schedule Tomorrow's schedule
+     */
+    private void notifyUsersAboutNextDaySchedule(List<Long> users, String groupName, List<TimeInterval> schedule) {
+        if (bot == null || users.isEmpty()) return;
+        
+        String msg = "📅 *Графік на завтра доступний!*\nГрупа: *" + groupName + "*\n\n" +
+                (schedule.isEmpty() ? "Відключень на завтра не заплановано. ✅\n" : "Графік на завтра:\n" + formatSchedule(schedule));
+        
+        // Send to all users with rate limiting using parallel processing
+        sendMessageToUsers(users, msg, "NEXT DAY SCHEDULE");
     }
 
     /**
@@ -751,16 +874,28 @@ public class NotificationService {
     }
 
     /**
-     * Send messages to multiple users with error handling for each user
+     * Send messages to multiple users with error handling for each user.
+     * Uses parallel processing for improved performance on multi-core systems.
+     * Respects Telegram API rate limit of 30 messages/second to different users.
      * 
      * @param users The list of user IDs
      * @param message The message to send
      * @param logTag The tag to use in error logs
      */
     private void sendMessageToUsers(List<Long> users, String message, String logTag) {
-        for (Long userId : users) {
-            sendMessageSafely(userId, message, logTag);
-        }
+        if (users.isEmpty()) return;
+        
+        // Use parallel stream for concurrent message sending
+        users.parallelStream().forEach(userId -> {
+            try {
+                sendMessageSafely(userId, message, logTag);
+                // 50ms delay ensures ~20 messages/second (safely under Telegram's 30 msg/s limit)
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.err.println("[" + logTag + "] Interrupted while sending to user " + userId);
+            }
+        });
     }
 
     /**
@@ -774,7 +909,8 @@ public class NotificationService {
     }
 
     /**
-     * Broadcast a message to all users
+     * Broadcast a message to all users using parallel processing.
+     * Leverages multi-core CPU for faster message delivery.
      * 
      * @param message The message to broadcast
      * @param initiatorChatId The chat ID of the user who initiated the broadcast (will be excluded from recipients)
@@ -784,25 +920,29 @@ public class NotificationService {
         if (bot == null) return 0;
 
         List<Long> allUsers = dbService.getAllUsers();
-        int successCount = 0;
-
-        for (Long userId : allUsers) {
-            // Skip sending to the initiator
-            if (userId == initiatorChatId) continue;
-
-            try {
-                if (sendMessageSafely(userId, message, "BROADCAST")) {
-                    successCount++;
+        
+        // Filter out initiator and use parallel stream for concurrent sending
+        long successCount = allUsers.parallelStream()
+            .filter(userId -> userId != initiatorChatId)
+            .map(userId -> {
+                try {
+                    boolean success = sendMessageSafely(userId, message, "BROADCAST");
+                    // Add a small delay to avoid hitting Telegram API limits
+                    Thread.sleep(50);
+                    return success ? 1 : 0;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.err.println("[BROADCAST] Interrupted while sending to user " + userId);
+                    return 0;
+                } catch (Exception e) {
+                    System.err.println("[BROADCAST] Failed to send message to user " + userId + ": " + e.getMessage());
+                    return 0;
                 }
+            })
+            .mapToInt(Integer::intValue)
+            .sum();
 
-                // Add a small delay to avoid hitting Telegram API limits
-                Thread.sleep(50);
-            } catch (Exception e) {
-                System.err.println("[BROADCAST] Failed to send message to user " + userId + ": " + e.getMessage());
-            }
-        }
-
-        return successCount;
+        return (int) successCount;
     }
 
     /**

@@ -17,6 +17,7 @@ public class AppConfig {
     private String botToken;
     private String botUsername;
     private String databasePath;
+    private int maxConcurrentChecks;
     private final Map<String, Address> addresses = new HashMap<>();
 
     public void loadConfig() throws IOException {
@@ -32,6 +33,7 @@ public class AppConfig {
             this.botToken = props.getProperty("bot.token");
             this.botUsername = props.getProperty("bot.username");
             this.databasePath = props.getProperty("database.path", "dtek_bot.db");
+            this.maxConcurrentChecks = Integer.parseInt(props.getProperty("thread.pool.max.concurrent.checks", "3"));
 
             loadAddresses(props);
             System.out.println("Configuration loaded successfully. Found " + addresses.size() + " addresses.");
@@ -76,5 +78,6 @@ public class AppConfig {
     public String getBotToken() { return botToken; }
     public String getBotUsername() { return botUsername; }
     public String getDatabasePath() { return databasePath; }
+    public int getMaxConcurrentChecks() { return maxConcurrentChecks; }
     public Map<String, Address> getAddresses() { return addresses; }
 }

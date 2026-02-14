@@ -31,11 +31,13 @@ public class PersistenceService {
      * @param schedule The list of schedule strings to save.
      */
     public void saveSchedule(List<String> schedule) {
-        System.out.println("Saving new schedule to cache file: " + CACHE_FILE.toAbsolutePath());
+        System.out.println("[DEBUG_LOG] PersistenceService.saveSchedule: Saving " + schedule.size() + " schedule entries to cache file: " + CACHE_FILE.toAbsolutePath());
         try {
             Files.write(CACHE_FILE, schedule, StandardCharsets.UTF_8);
+            System.out.println("[DEBUG_LOG] PersistenceService.saveSchedule: Successfully saved schedule to cache");
         } catch (IOException e) {
-            System.err.println("CRITICAL: Failed to write to cache file " + CACHE_FILE + ": " + e.getMessage());
+            System.err.println("[DEBUG_LOG] PersistenceService.saveSchedule: CRITICAL - Failed to write to cache file " + CACHE_FILE + ": " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -45,14 +47,17 @@ public class PersistenceService {
      * @return A list of strings representing the cached schedule, or an empty list if no cache exists.
      */
     public List<String> loadLastSchedule() {
-        System.out.println("Loading last schedule from cache file: " + CACHE_FILE.toAbsolutePath());
+        System.out.println("[DEBUG_LOG] PersistenceService.loadLastSchedule: Attempting to load schedule from cache file: " + CACHE_FILE.toAbsolutePath());
         try {
-            return Files.readAllLines(CACHE_FILE, StandardCharsets.UTF_8);
+            List<String> schedule = Files.readAllLines(CACHE_FILE, StandardCharsets.UTF_8);
+            System.out.println("[DEBUG_LOG] PersistenceService.loadLastSchedule: Successfully loaded " + schedule.size() + " schedule entries from cache");
+            return schedule;
         } catch (NoSuchFileException e) {
-            System.out.println("Cache file not found. This must be the first run.");
+            System.out.println("[DEBUG_LOG] PersistenceService.loadLastSchedule: Cache file not found. This must be the first run or cache was deleted.");
             return Collections.emptyList();
         } catch (IOException e) {
-            System.err.println("Warning: Failed to read from cache file " + CACHE_FILE + ": " + e.getMessage());
+            System.err.println("[DEBUG_LOG] PersistenceService.loadLastSchedule: Warning - Failed to read from cache file " + CACHE_FILE + ": " + e.getMessage());
+            e.printStackTrace();
             return Collections.emptyList();
         }
     }
@@ -66,10 +71,34 @@ public class PersistenceService {
      * @return true if the schedules are different, false otherwise.
      */
     public boolean areSchedulesDifferent(List<String> oldSchedule, List<String> newSchedule) {
+        System.out.println("[DEBUG_LOG] PersistenceService.areSchedulesDifferent: Comparing schedules - Old: " + oldSchedule.size() + " entries, New: " + newSchedule.size() + " entries");
+        
         // Use Sets for order-independent comparison
         Set<String> oldSet = new HashSet<>(oldSchedule);
         Set<String> newSet = new HashSet<>(newSchedule);
 
-        return !oldSet.equals(newSet);
+        boolean different = !oldSet.equals(newSet);
+        
+        if (different) {
+            System.out.println("[DEBUG_LOG] PersistenceService.areSchedulesDifferent: Schedules are DIFFERENT");
+            
+            // Log what was added
+            Set<String> added = new HashSet<>(newSet);
+            added.removeAll(oldSet);
+            if (!added.isEmpty()) {
+                System.out.println("[DEBUG_LOG] PersistenceService.areSchedulesDifferent: Added entries: " + added);
+            }
+            
+            // Log what was removed
+            Set<String> removed = new HashSet<>(oldSet);
+            removed.removeAll(newSet);
+            if (!removed.isEmpty()) {
+                System.out.println("[DEBUG_LOG] PersistenceService.areSchedulesDifferent: Removed entries: " + removed);
+            }
+        } else {
+            System.out.println("[DEBUG_LOG] PersistenceService.areSchedulesDifferent: Schedules are IDENTICAL");
+        }
+        
+        return different;
     }
 }

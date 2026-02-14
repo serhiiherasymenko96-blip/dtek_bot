@@ -1,11 +1,11 @@
-System Prompt: Context & Guidelines for DTEK Scraper Bot (v7.2.4-STABLE)
+System Prompt: Context & Guidelines for DTEK Scraper Bot (v8.0.0+)
 Project Goal: Java-based Telegram bot that monitors electricity outage schedules on the DTEK website for specific addresses and notifies users about changes.
 
 Infrastructure Constraints (CRITICAL):
 
-Server: Google Cloud e2-micro (2 vCPU, 1 GB RAM).
+Server: Mini PC with Ryzen 5 4650G (6 cores, 12 threads, 32 GB RAM).
 
-Disk: 10 GB total (Risk of filling up with browser profiles).
+Disk: 250 GB SSD (Sufficient space for browser profiles and data).
 
 OS: Linux (Debian/Ubuntu).
 
@@ -65,6 +65,64 @@ Local Debug: headless = false (Allowed for visual debugging).
 
 User Agent: Must be set to a standard Windows/Desktop UA to bypass basic bot detection.
 
+5. Multithreading Configuration (NEW - v8.0.0+)
+
+With the upgraded infrastructure (Ryzen 5 4650G), the application now supports parallel execution:
+
+Concurrent Address Checks: Configurable via thread.pool.max.concurrent.checks in config.properties (default: 3).
+
+Each browser session uses ~500MB RAM and 1-2 CPU cores.
+
+Recommended values: 3-4 for Ryzen 5 4650G (6 cores, 32GB RAM).
+
+Parallel User Notifications: The system automatically uses parallel streams to send notifications to multiple users concurrently, improving delivery speed.
+
+Thread Safety: All parallel operations use proper synchronization (Semaphore, CountDownLatch) and the safeRun pattern.
+
+6. Next Day Schedule Monitoring (NEW - v8.0.0+)
+
+The bot now supports proactive monitoring and notification for tomorrow's electricity schedules:
+
+Schedule Check Timing:
+
+Automatic checks run hourly after 20:00 (8 PM) and before midnight.
+
+Uses the same optimization strategies as regular checks (group caching, semaphore-based concurrency control).
+
+Database Structure:
+
+next_day_groups table: Stores tomorrow's schedules separately from today's schedules.
+
+At midnight (00:00-00:05), the system automatically copies next_day_groups to the main groups table.
+
+First Appearance Detection:
+
+When tomorrow's schedule appears for the first time (oldGroupSched == null), the system immediately notifies all subscribed users.
+
+Notifications are sent regardless of whether the schedule shows outages or no outages.
+
+Notification Strategy:
+
+Tomorrow's schedule notifications are time-sensitive and sent immediately (not queued).
+
+Uses parallel streams with 50ms delay per message (~20 msg/s, under Telegram's 30 msg/s limit).
+
+Message format: "📅 *Графік на завтра доступний!*" with group name and schedule details.
+
+User Commands:
+
+/nextday: Allows users to manually check tomorrow's schedule for their subscribed address.
+
+Triggers forceCheckNextDayAddress() which uses the same next day checking logic.
+
+Implementation Notes:
+
+All next day checks use checkNextDayAddressInSession() method in DtekScraperService.
+
+Results are handled by handleNextDayScrapeResult() which updates next_day_groups table.
+
+The runNextDayScheduleCheck() task is wrapped in safeRun() for stability (line 215 in NotificationService).
+
 ⚠️ Instruction for the AI: When generating code or debugging:
 
 NEVER suggest disabling CSS (stylesheet = 2). It breaks the scraper.
@@ -73,4 +131,4 @@ ALWAYS respect the safeRun pattern for background tasks.
 
 ALWAYS include the temp directory cleanup logic in main.
 
-REMEMBER that on e2-micro, UI elements load slowly. Use explicit sleep or Condition checks before interactions.
+Use explicit sleep or Condition checks before interactions with UI elements.

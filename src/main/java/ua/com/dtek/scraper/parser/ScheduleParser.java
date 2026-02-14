@@ -32,19 +32,24 @@ public class ScheduleParser {
      * @throws RuntimeException If there's a mismatch between cells and headers
      */
     public List<TimeInterval> parse(String tableHtml) {
-        System.out.println("--- Parsing table HTML ---");
+        System.out.println("[DEBUG_LOG] ScheduleParser.parse: Starting HTML table parsing");
         Document doc = Jsoup.parse(tableHtml);
 
         Elements cells = doc.select("tbody td[class^=cell-]");
         Elements headers = doc.select("thead th[scope=col] div");
 
+        System.out.println("[DEBUG_LOG] ScheduleParser.parse: Found " + cells.size() + " cells and " + headers.size() + " headers");
+
         if (cells.size() != headers.size()) {
-            String msg = "Parser Error: Mismatch in cell/header count.";
-            System.err.println(msg);
+            String msg = "Parser Error: Mismatch in cell/header count. Cells: " + cells.size() + ", Headers: " + headers.size();
+            System.err.println("[DEBUG_LOG] ScheduleParser.parse: " + msg);
             throw new RuntimeException(msg);
         }
 
-        if (cells.isEmpty()) return new ArrayList<>();
+        if (cells.isEmpty()) {
+            System.out.println("[DEBUG_LOG] ScheduleParser.parse: No cells found, returning empty list");
+            return new ArrayList<>();
+        }
 
         List<TimeInterval> outageIntervals = new ArrayList<>();
         for (int i = 0; i < cells.size(); i++) {
@@ -52,11 +57,16 @@ public class ScheduleParser {
             String timeSlot = headers.get(i).text();
             String className = cell.className();
 
+            System.out.println("[DEBUG_LOG] ScheduleParser.parse: Processing cell #" + i + " - timeSlot: " + timeSlot + ", className: " + className);
+
             TimeInterval interval = parseCellClass(className, timeSlot);
             if (interval != null) {
+                System.out.println("[DEBUG_LOG] ScheduleParser.parse: Added outage interval: " + interval.startTime() + " - " + interval.endTime());
                 outageIntervals.add(interval);
             }
         }
+
+        System.out.println("[DEBUG_LOG] ScheduleParser.parse: Total raw outage intervals before merging: " + outageIntervals.size());
 
         // No need to sort before merging as we'll sort after
         List<TimeInterval> mergedIntervals = mergeIntervals(outageIntervals);
@@ -64,7 +74,7 @@ public class ScheduleParser {
         // Sort after merging to ensure consistency
         mergedIntervals.sort(Comparator.comparing(TimeInterval::startTime));
 
-        System.out.println("--- Parsing complete: Found " + mergedIntervals.size() + " intervals. ---");
+        System.out.println("[DEBUG_LOG] ScheduleParser.parse: Parsing complete. Found " + mergedIntervals.size() + " merged intervals.");
         return mergedIntervals;
     }
 
@@ -80,14 +90,28 @@ public class ScheduleParser {
         LocalTime warningStartTime = now.plusMinutes(30);
         LocalTime warningEndTime = now.plusMinutes(40);
 
-        return schedule.stream()
+        System.out.println("[DEBUG_LOG] ScheduleParser.findUpcomingShutdowns: Current time (Kyiv): " + now.format(TIME_FORMATTER));
+        System.out.println("[DEBUG_LOG] ScheduleParser.findUpcomingShutdowns: Warning window: " + warningStartTime.format(TIME_FORMATTER) + " - " + warningEndTime.format(TIME_FORMATTER));
+        System.out.println("[DEBUG_LOG] ScheduleParser.findUpcomingShutdowns: Checking " + schedule.size() + " intervals");
+
+        List<TimeInterval> upcomingShutdowns = schedule.stream()
                 .filter(interval -> {
                     try {
                         LocalTime start = LocalTime.parse(interval.startTime(), TIME_FORMATTER);
-                        return !start.isBefore(warningStartTime) && start.isBefore(warningEndTime);
-                    } catch (Exception e) { return false; }
+                        boolean isUpcoming = !start.isBefore(warningStartTime) && start.isBefore(warningEndTime);
+                        if (isUpcoming) {
+                            System.out.println("[DEBUG_LOG] ScheduleParser.findUpcomingShutdowns: Found upcoming shutdown: " + interval.startTime() + " - " + interval.endTime());
+                        }
+                        return isUpcoming;
+                    } catch (Exception e) { 
+                        System.err.println("[DEBUG_LOG] ScheduleParser.findUpcomingShutdowns: Error parsing interval " + interval.startTime() + ": " + e.getMessage());
+                        return false; 
+                    }
                 })
                 .collect(Collectors.toList());
+
+        System.out.println("[DEBUG_LOG] ScheduleParser.findUpcomingShutdowns: Found " + upcomingShutdowns.size() + " upcoming shutdowns");
+        return upcomingShutdowns;
     }
 
     /**
@@ -98,18 +122,30 @@ public class ScheduleParser {
      * @return A list of merged time intervals
      */
     private List<TimeInterval> mergeIntervals(List<TimeInterval> intervals) {
-        if (intervals.isEmpty()) return new ArrayList<>();
+        System.out.println("[DEBUG_LOG] ScheduleParser.mergeIntervals: Starting merge of " + intervals.size() + " intervals");
+        if (intervals.isEmpty()) {
+            System.out.println("[DEBUG_LOG] ScheduleParser.mergeIntervals: No intervals to merge, returning empty list");
+            return new ArrayList<>();
+        }
         LinkedList<TimeInterval> merged = new LinkedList<>();
         merged.add(intervals.get(0));
+        System.out.println("[DEBUG_LOG] ScheduleParser.mergeIntervals: Initial interval: " + intervals.get(0).startTime() + " - " + intervals.get(0).endTime());
+        
+        int mergeCount = 0;
         for (int i = 1; i < intervals.size(); i++) {
             TimeInterval current = intervals.get(i);
             TimeInterval last = merged.getLast();
             if (last.endTime().equals(current.startTime())) {
-                merged.set(merged.size() - 1, new TimeInterval(last.startTime(), current.endTime()));
+                TimeInterval mergedInterval = new TimeInterval(last.startTime(), current.endTime());
+                merged.set(merged.size() - 1, mergedInterval);
+                mergeCount++;
+                System.out.println("[DEBUG_LOG] ScheduleParser.mergeIntervals: Merged [" + last.startTime() + " - " + last.endTime() + "] + [" + current.startTime() + " - " + current.endTime() + "] -> [" + mergedInterval.startTime() + " - " + mergedInterval.endTime() + "]");
             } else {
                 merged.add(current);
+                System.out.println("[DEBUG_LOG] ScheduleParser.mergeIntervals: Added separate interval: " + current.startTime() + " - " + current.endTime());
             }
         }
+        System.out.println("[DEBUG_LOG] ScheduleParser.mergeIntervals: Merge complete. Performed " + mergeCount + " merges. Result: " + merged.size() + " intervals");
         return merged;
     }
 

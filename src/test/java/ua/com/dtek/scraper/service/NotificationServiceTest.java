@@ -46,7 +46,7 @@ public class NotificationServiceTest {
             addresses.put(key, address);
         }
 
-        notificationService = new NotificationService(dbService, scraperService, scheduleParser, addresses);
+        notificationService = new NotificationService(dbService, scraperService, scheduleParser, addresses, 2);
     }
 
     @Test

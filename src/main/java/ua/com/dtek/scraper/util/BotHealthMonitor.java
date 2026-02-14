@@ -23,19 +23,24 @@ public class BotHealthMonitor {
      * @param scheduler The scheduler to use for health checks
      */
     public BotHealthMonitor(TelegramLongPollingBot bot, ScheduledExecutorService scheduler) {
+        System.out.println("[DEBUG_LOG] BotHealthMonitor: Initializing health monitor");
         this.bot = bot;
         this.scheduler = scheduler;
+        System.out.println("[DEBUG_LOG] BotHealthMonitor: Health monitor initialized, status: healthy");
     }
 
     /**
      * Marks the bot as unhealthy and schedules a health check.
      */
     public void markBotUnhealthy() {
+        System.out.println("[DEBUG_LOG] BotHealthMonitor.markBotUnhealthy: Attempting to mark bot as unhealthy");
         synchronized (healthLock) {
             if (isBotHealthy) {
                 isBotHealthy = false;
-                System.err.println("[BOT HEALTH] Bot marked as unhealthy, scheduling recovery check");
+                System.err.println("[DEBUG_LOG] BotHealthMonitor.markBotUnhealthy: Bot marked as UNHEALTHY, scheduling recovery check in 60 seconds");
                 scheduler.schedule(this::checkBotHealth, 60, TimeUnit.SECONDS);
+            } else {
+                System.out.println("[DEBUG_LOG] BotHealthMonitor.markBotUnhealthy: Bot already marked as unhealthy, skipping");
             }
         }
     }
@@ -45,15 +50,17 @@ public class BotHealthMonitor {
      * If the bot is healthy, marks it as such. Otherwise, schedules another health check.
      */
     private void checkBotHealth() {
+        System.out.println("[DEBUG_LOG] BotHealthMonitor.checkBotHealth: Running health check");
         try {
             // Attempt to execute a simple operation to check the bot's state
             bot.getMe();
             synchronized (healthLock) {
                 isBotHealthy = true;
-                System.out.println("[BOT HEALTH] Bot recovered successfully");
+                System.out.println("[DEBUG_LOG] BotHealthMonitor.checkBotHealth: Bot RECOVERED successfully, marked as healthy");
             }
         } catch (Exception e) {
-            System.err.println("[BOT HEALTH] Bot still unhealthy: " + e.getMessage());
+            System.err.println("[DEBUG_LOG] BotHealthMonitor.checkBotHealth: Bot still UNHEALTHY: " + e.getMessage());
+            System.out.println("[DEBUG_LOG] BotHealthMonitor.checkBotHealth: Scheduling another health check in 60 seconds");
             scheduler.schedule(this::checkBotHealth, 60, TimeUnit.SECONDS);
         }
     }
@@ -65,6 +72,7 @@ public class BotHealthMonitor {
      */
     public boolean isBotHealthy() {
         synchronized (healthLock) {
+            System.out.println("[DEBUG_LOG] BotHealthMonitor.isBotHealthy: Current health status queried: " + (isBotHealthy ? "HEALTHY" : "UNHEALTHY"));
             return isBotHealthy;
         }
     }

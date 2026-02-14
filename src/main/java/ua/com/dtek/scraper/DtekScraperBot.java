@@ -101,7 +101,8 @@ public class DtekScraperBot extends TelegramLongPollingBot {
                     dbService,
                     scraperService,
                     parser,
-                    config.getAddresses()
+                    config.getAddresses(),
+                    config.getMaxConcurrentChecks()
             );
 
             // 6. Register and start the bot
@@ -204,8 +205,7 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             sendWelcomeMessage(chatId);
         } else if ("/check".equals(text)) {
             System.out.println("Received /check command from user: " + chatId);
-            sendMessage(chatId, "🔍 Запускаю незаплановану перевірку графіків...");
-            notificationService.forceCheckAllAddresses(chatId);
+            handleCheckCommand(chatId);
         } else if ("/nextday".equals(text)) {
             System.out.println("Received /nextday command from user: " + chatId);
             handleNextDayCommand(chatId);
@@ -214,6 +214,27 @@ public class DtekScraperBot extends TelegramLongPollingBot {
             System.out.println("Received /broadcast command from user: " + chatId);
             handleBroadcastCommand(chatId, text);
         }
+    }
+
+    /**
+     * Handle the check command to check the current schedule for the user's subscribed address
+     * 
+     * @param chatId The chat ID of the user who sent the command
+     */
+    private void handleCheckCommand(long chatId) {
+        // Get the user's subscribed address
+        String addressKey = dbService.getUserSubscribedAddress(chatId);
+
+        if (addressKey == null) {
+            sendMessage(chatId, "⚠️ Ви не підписані на жодну адресу. Використайте команду /start щоб обрати адресу.");
+            return;
+        }
+
+        // Send a message to the user
+        sendMessage(chatId, "🔍 Запускаю незаплановану перевірку графіка для вашої адреси...");
+
+        // Check the address
+        notificationService.forceCheckAddress(addressKey, chatId);
     }
 
     /**

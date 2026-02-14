@@ -59,6 +59,23 @@ public class DatabaseService {
             try { stmt.execute("ALTER TABLE addresses ADD COLUMN group_name TEXT"); } catch (SQLException e) {}
             try { stmt.execute("ALTER TABLE addresses ADD COLUMN group_last_checked INTEGER NOT NULL DEFAULT 0"); } catch (SQLException e) {}
 
+            // Міграція: видалення префікса "Черга " з існуючих назв груп
+            try {
+                // Clean group names in addresses table
+                stmt.execute("UPDATE addresses SET group_name = SUBSTR(group_name, 7) WHERE group_name LIKE 'Черга %'");
+                System.out.println("[MIGRATION] Cleaned group names in addresses table");
+                
+                // Clean group names in groups table
+                stmt.execute("UPDATE groups SET group_name = SUBSTR(group_name, 7) WHERE group_name LIKE 'Черга %'");
+                System.out.println("[MIGRATION] Cleaned group names in groups table");
+                
+                // Clean group names in next_day_groups table
+                stmt.execute("UPDATE next_day_groups SET group_name = SUBSTR(group_name, 7) WHERE group_name LIKE 'Черга %'");
+                System.out.println("[MIGRATION] Cleaned group names in next_day_groups table");
+            } catch (SQLException e) {
+                System.err.println("[MIGRATION] Error cleaning group names: " + e.getMessage());
+            }
+
             // Заповнення адрес
             try (PreparedStatement ps = conn.prepareStatement("INSERT OR IGNORE INTO addresses (address_key, display_name) VALUES (?, ?)")) {
                 for (Map.Entry<String, Address> entry : monitoredAddresses.entrySet()) {

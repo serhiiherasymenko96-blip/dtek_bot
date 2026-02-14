@@ -24,37 +24,43 @@ public class RetryUtil {
      * @throws RuntimeException If all retry attempts fail
      */
     public static <T> T withRetry(Supplier<T> operation, int maxRetries, String operationName, long delayMs) {
+        System.out.println("[DEBUG_LOG] RetryUtil.withRetry: Starting operation '" + operationName + "' with max " + maxRetries + " retries, delay " + delayMs + "ms");
         Exception lastException = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             try {
                 if (attempt > 0) {
-                    System.out.println("Retry attempt " + attempt + " for " + operationName);
+                    System.out.println("[DEBUG_LOG] RetryUtil.withRetry: Retry attempt " + attempt + "/" + maxRetries + " for '" + operationName + "'");
                     // Pause before retry
                     try {
                         Thread.sleep(delayMs);
                     } catch (InterruptedException ie) {
+                        System.err.println("[DEBUG_LOG] RetryUtil.withRetry: Retry sleep interrupted for '" + operationName + "'");
                         Thread.currentThread().interrupt();
                     }
+                } else {
+                    System.out.println("[DEBUG_LOG] RetryUtil.withRetry: Initial attempt for '" + operationName + "'");
                 }
 
-                return operation.get();
+                T result = operation.get();
+                System.out.println("[DEBUG_LOG] RetryUtil.withRetry: Operation '" + operationName + "' succeeded on attempt " + attempt);
+                return result;
 
             } catch (Exception e) {
                 lastException = e;
-                String msg = "[RETRY ERROR] Failed at attempt " + attempt + " for " + operationName + ": " + e.getMessage();
+                String msg = "[DEBUG_LOG] RetryUtil.withRetry: Failed at attempt " + attempt + "/" + maxRetries + " for '" + operationName + "': " + e.getMessage();
                 System.err.println(msg);
 
                 if (attempt == maxRetries) {
-                    System.err.println("All retry attempts failed for " + operationName);
+                    System.err.println("[DEBUG_LOG] RetryUtil.withRetry: All retry attempts exhausted for '" + operationName + "'");
                 } else {
-                    System.out.println("Will retry in " + (delayMs / 1000) + " seconds...");
+                    System.out.println("[DEBUG_LOG] RetryUtil.withRetry: Will retry in " + (delayMs / 1000.0) + " seconds...");
                 }
             }
         }
 
         // If we get here, all retries failed
-        String finalMsg = "[RETRY ERROR] Failed after " + maxRetries + " retries for " + operationName + ": " + 
+        String finalMsg = "[DEBUG_LOG] RetryUtil.withRetry: FINAL FAILURE after " + maxRetries + " retries for '" + operationName + "': " + 
                           (lastException != null ? lastException.getMessage() : "Unknown error");
         System.err.println(finalMsg);
         throw new RuntimeException(finalMsg, lastException);
